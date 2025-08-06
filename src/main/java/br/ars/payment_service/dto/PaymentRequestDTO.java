@@ -6,7 +6,7 @@ import br.ars.payment_service.enums.MetodoPagamento;
 
 public class PaymentRequestDTO {
 
-    private UUID assinaturaId;
+    private UUID assinaturaId; // é a mesma do usuario
     private Double valor;
     private MetodoPagamento metodoPagamento;
     private DetalhesPagamentoDTO detalhes;

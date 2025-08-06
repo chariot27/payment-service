@@ -8,10 +8,10 @@ import org.springframework.web.bind.annotation.PathVariable;
 
 
 
-@FeignClient(name = "assinatura-service", url = "${services.assinatura.url}")
+@FeignClient(name = "assinatura-service", url = "https://subscription-service-r3sg.onrender.com")
 public interface AssinaturaClient {
 
-    @GetMapping("/assinaturas/existe/{id}")
-    Boolean existeAssinatura(@PathVariable("id") UUID id);
+    @GetMapping("/usuario/{userId}")
+    Boolean existeAssinatura(@PathVariable("userId") UUID userId);
 }
 
