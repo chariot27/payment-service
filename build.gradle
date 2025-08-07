@@ -1,50 +1,46 @@
 plugins {
     id 'java'
-    id 'org.springframework.boot' version '3.3.2'
+    id 'org.springframework.boot' version '3.2.4'
     id 'io.spring.dependency-management' version '1.1.4'
 }
 
 group = 'br.ars'
 version = '0.0.1-SNAPSHOT'
-
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(17)
-    }
-}
+sourceCompatibility = '17'
 
 repositories {
     mavenCentral()
 }
 
-ext {
-    set('springCloudVersion', "2023.0.1") // compatível com Spring Boot 3.3.x
-}
-
 dependencies {
+    // Spring Boot Essentials
     implementation 'org.springframework.boot:spring-boot-starter-web'
-    implementation 'org.springframework.boot:spring-boot-starter-mail'
-    implementation 'org.springframework.cloud:spring-cloud-starter-openfeign'
-    implementation 'com.stripe:stripe-java:24.9.0'
-    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
 
-    // Lombok
+    // Stripe SDK
+    implementation 'com.stripe:stripe-java:24.18.0'
+
+    // PostgreSQL (ou o banco que estiver usando)
+    runtimeOnly 'org.postgresql:postgresql'
+
+    // MapStruct para DTO <-> Entity
+    implementation 'org.mapstruct:mapstruct:1.5.5.Final'
+    annotationProcessor 'org.mapstruct:mapstruct-processor:1.5.5.Final'
+
+    // Lombok (boilerplate killers)
     compileOnly 'org.projectlombok:lombok'
     annotationProcessor 'org.projectlombok:lombok'
+    testCompileOnly 'org.projectlombok:lombok'
+    testAnnotationProcessor 'org.projectlombok:lombok'
 
-    // Banco de Dados
-    runtimeOnly 'org.postgresql:postgresql'
+    // SendGrid (opcional, para e-mail pós-pagamento)
+    implementation 'com.sendgrid:sendgrid-java:4.10.1'
 
     // Testes
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }
 
-dependencyManagement {
-    imports {
-        mavenBom "org.springframework.cloud:spring-cloud-dependencies:${springCloudVersion}"
-    }
-}
-
-tasks.named('test') {
+test {
     useJUnitPlatform()
 }
