@@ -1,58 +1,67 @@
 package br.ars.payment_service.services;
 
+import br.ars.payment_service.dto.CreatePaymentRequestDTO;
 import br.ars.payment_service.clients.AssinaturaClient;
-import br.ars.payment_service.dto.PaymentRequestDTO;
-import br.ars.payment_service.dto.PaymentResponseDTO;
-import br.ars.payment_service.enums.StatusPagamento;
-import br.ars.payment_service.mappers.PaymentMapper;
-import br.ars.payment_service.models.Payment;
-import br.ars.payment_service.repositories.PaymentRepository;
-import jakarta.transaction.Transactional;
+import com.stripe.exception.StripeException;
+import com.stripe.model.Customer;
+import com.stripe.model.Subscription;
+import com.stripe.param.CustomerCreateParams;
+import com.stripe.param.SubscriptionCreateParams;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-
-import java.time.LocalDate;
-import java.util.List;
-import java.util.UUID;
-import java.util.stream.Collectors;
 
 @Service
 public class PaymentService {
 
-    private final PaymentRepository paymentRepository;
-    private final PaymentMapper paymentMapper;
     private final AssinaturaClient assinaturaClient;
+    private final EmailService emailService;
 
-    public PaymentService(PaymentRepository paymentRepository,
-                          PaymentMapper paymentMapper,
-                          AssinaturaClient assinaturaClient) {
-        this.paymentRepository = paymentRepository;
-        this.paymentMapper = paymentMapper;
+    @Value("${stripe.price.id}")
+    private String priceId;
+
+    public PaymentService(AssinaturaClient assinaturaClient, EmailService emailService) {
         this.assinaturaClient = assinaturaClient;
+        this.emailService = emailService;
     }
 
-    @Transactional
-    public PaymentResponseDTO criarPagamento(PaymentRequestDTO dto) {
-        Boolean existe = assinaturaClient.existeAssinatura(dto.getAssinaturaId());
-        if (existe == null || !existe) {
-            throw new IllegalArgumentException("Assinatura não encontrada.");
+    public boolean processarPagamento(CreatePaymentRequestDTO dto) throws StripeException {
+
+        if (assinaturaClient.existeAssinatura(dto.getUserId())) {
+            return false;
         }
 
-        Payment pagamento = paymentMapper.toEntity(dto);
-        pagamento.setStatus(StatusPagamento.PAGO);
-        pagamento.setDataPagamento(LocalDate.now());
+        // Criação de cliente no Stripe
+        Customer customer = Customer.create(CustomerCreateParams.builder()
+                .setEmail(dto.getEmail())
+                .setPaymentMethod(dto.getPaymentMethodId())
+                .setInvoiceSettings(
+                        CustomerCreateParams.InvoiceSettings.builder()
+                                .setDefaultPaymentMethod(dto.getPaymentMethodId())
+                                .build())
+                .build());
 
-        return paymentMapper.toDto(paymentRepository.save(pagamento));
-    }
+        // Criação de assinatura
+        Subscription subscription = Subscription.create(
+            SubscriptionCreateParams.builder()
+                .setCustomer(customer.getId())
+                .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
+                .setPaymentSettings(
+                    SubscriptionCreateParams.PaymentSettings.builder()
+                        .setSaveDefaultPaymentMethod(
+                            SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION
+                        ).build())
+                // .setExpand(...) REMOVIDO
+                .build()
+        );
 
-    public List<PaymentResponseDTO> listarPagamentos() {
-        return paymentRepository.findAll().stream()
-                .map(paymentMapper::toDto)
-                .collect(Collectors.toList());
-    }
 
-    public PaymentResponseDTO buscarPorId(UUID id) {
-        Payment pagamento = paymentRepository.findById(id)
-                .orElseThrow(() -> new IllegalArgumentException("Pagamento não encontrado."));
-        return paymentMapper.toDto(pagamento);
+        // Validação da assinatura e envio de e-mail
+        if ("active".equals(subscription.getStatus())) {
+            emailService.enviarEmail(dto.getEmail(), "Assinatura Confirmada", "Seu pagamento foi aprovado.");
+            return true;
+        } else {
+            emailService.enviarEmail(dto.getEmail(), "Pagamento Falhou", "Houve uma falha no seu pagamento.");
+            return false;
+        }
     }
 }
