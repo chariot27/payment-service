@@ -10,6 +10,7 @@ RUN gradle build -x test --no-daemon
 
 # Etapa 2: Imagem final com JRE otimizado
 FROM eclipse-temurin:17-jdk-alpine
+ENV JAVA_TOOL_OPTIONS="-XX:+UseG1GC -XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
 WORKDIR /app
 
 # Copia o .jar da etapa anterior

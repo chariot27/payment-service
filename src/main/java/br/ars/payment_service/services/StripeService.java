@@ -36,7 +36,7 @@ public class StripeService {
             .addLineItem(
                 SessionCreateParams.LineItem.builder()
                     .setQuantity(1L)
-                    .setPrice(priceId) // 🔥 Agora usando o Price ID configurado no Stripe
+                    .setPrice(priceId)
                     .build()
             )
             .build();
