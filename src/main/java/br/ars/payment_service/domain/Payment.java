@@ -4,72 +4,66 @@ import jakarta.persistence.*;
 import lombok.*;
 import org.hibernate.annotations.OptimisticLockType;
 import org.hibernate.annotations.OptimisticLocking;
+import org.hibernate.annotations.UuidGenerator;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 
-@Getter @Setter @Builder
-@AllArgsConstructor @NoArgsConstructor
 @Entity
 @Table(
-    name = "payments",
-    indexes = {
-        @Index(name = "idx_payments_user",    columnList = "user_id"),
-        @Index(name = "idx_payments_status",  columnList = "status"),
-        @Index(name = "idx_payments_expires", columnList = "expires_at")
-    }
+  name = "payments",
+  indexes = {
+    @Index(name="idx_payments_user",    columnList="user_id"),
+    @Index(name="idx_payments_status",  columnList="status"),
+    @Index(name="idx_payments_expires", columnList="expires_at")
+  }
 )
 @OptimisticLocking(type = OptimisticLockType.VERSION)
+@Getter @Setter @Builder
+@AllArgsConstructor @NoArgsConstructor
 public class Payment {
 
-    // ⚠️ A tabela usa BIGINT. Trocar para Long + IDENTITY elimina o erro do Postgres.
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    @Column(name = "id")
-    private Long id;
+  @Id
+  @UuidGenerator
+  @Column(name = "id", columnDefinition = "uuid")
+  private UUID id;
 
-    @Column(name = "user_id", nullable = false)
-    private UUID userId;
+  @Column(name = "user_id", nullable=false, columnDefinition = "uuid")
+  private UUID userId;
 
-    @Column(name = "txid", nullable = false, unique = true, length = 35)
-    private String txid;
+  @Column(nullable=false, unique=true, length=35)
+  private String txid;
 
-    @Column(name = "end_to_end_id", length = 50)
-    private String endToEndId;
+  @Column(name = "end_to_end_id", length=50)
+  private String endToEndId;
 
-    @Column(name = "amount", nullable = false, precision = 12, scale = 2)
-    private BigDecimal amount;
+  @Column(nullable=false, precision=12, scale=2)
+  private BigDecimal amount;
 
-    @Enumerated(EnumType.STRING)
-    @Column(name = "status", nullable = false, length = 20)
-    private PaymentStatus status;
+  @Enumerated(EnumType.STRING)
+  @Column(nullable=false, length=20)
+  private PaymentStatus status;
 
-    @Lob @Column(name="pix_payload", nullable=false, columnDefinition = "text")
-    private String pixPayload;
+  @Lob @Column(name="pix_payload", nullable=false)
+  private String pixPayload;
 
-    @Lob @Column(name="qr_png_base64", columnDefinition = "text")
-    private String qrPngBase64;
+  @Lob @Column(name="qr_png_base64")
+  private String qrPngBase64;
 
+  @Column(name="created_at", nullable=false)
+  private OffsetDateTime createdAt;
 
-    @Column(name = "created_at", nullable = false)
-    private OffsetDateTime createdAt;
+  @Column(name="confirmed_at")
+  private OffsetDateTime confirmedAt;
 
-    @Column(name = "confirmed_at")
-    private OffsetDateTime confirmedAt;
+  @Column(name="expires_at", nullable=false)
+  private OffsetDateTime expiresAt;
 
-    @Column(name = "expires_at", nullable = false)
-    private OffsetDateTime expiresAt;
+  @Version
+  private long version;
 
-    @Version
-    @Column(name = "version")
-    private long version;
-
-    @PrePersist
-    public void onCreate() {
-        if (this.createdAt == null) {
-            this.createdAt = OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS);
-        }
-    }
+  @PrePersist
+  public void onCreate() { this.createdAt = OffsetDateTime.now(); }
 }
