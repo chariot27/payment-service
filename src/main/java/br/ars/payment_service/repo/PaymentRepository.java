@@ -9,7 +9,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-public interface PaymentRepository extends JpaRepository<Payment, UUID> {
+public interface PaymentRepository extends JpaRepository<Payment, Long> {
     Optional<Payment> findByTxid(String txid);
     List<Payment> findByStatusAndExpiresAtBefore(PaymentStatus status, OffsetDateTime before);
 }

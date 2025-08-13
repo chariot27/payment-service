@@ -28,13 +28,13 @@ public class PaymentService {
     @Value("${pix.qr.expiration-minutes}") private int expirationMinutes;
     @Value("${pix.amount}") private String amountStr;
 
+    /** Gera TXID (máx 35 chars): PREFIX-yyyymmddHHMM-xxxxx */
     private String newTxid() {
-        // TXID máx 35: PREFIX-yyyymmddHHMM-xxxxx
         String rand = Long.toString(ThreadLocalRandom.current().nextLong(36_000_000L), 36).toUpperCase();
         String when = java.time.format.DateTimeFormatter.ofPattern("yyyyMMddHHmm")
-                .format(java.time.OffsetDateTime.now());
+                .format(OffsetDateTime.now());
         String base = (txidPrefix + "-" + when + "-" + rand).replaceAll("[^A-Z0-9\\-]", "");
-        return base.length() > 35 ? base.substring(0,35) : base;
+        return base.length() > 35 ? base.substring(0, 35) : base;
     }
 
     @Transactional
@@ -52,46 +52,56 @@ public class PaymentService {
                 .qrPngBase64(pix.qrBase64())
                 .expiresAt(OffsetDateTime.now().plusMinutes(expirationMinutes).truncatedTo(ChronoUnit.SECONDS))
                 .build();
-        return paymentRepo.save(p);
+
+        return paymentRepo.save(p); // agora o Postgres gera o BIGINT id
     }
 
-    /** Confirmação por webhook do seu PSP/banco. Idempotente via txid. */
+    /** Confirmação por webhook do PSP. Idempotente via txid. */
     @Transactional
     public Optional<Payment> confirmPayment(WebhookPixEvent evt) {
-        if (evt == null || evt.txid() == null) return Optional.empty();
+        if (evt == null || evt.txid() == null || evt.txid().isBlank()) return Optional.empty();
+
         var opt = paymentRepo.findByTxid(evt.txid());
         if (opt.isEmpty()) return Optional.empty();
 
         Payment p = opt.get();
         if (p.getStatus() == PaymentStatus.CONFIRMED) return Optional.of(p);
 
-        if ("CONFIRMED".equalsIgnoreCase(evt.status())) {
-            p.setStatus(PaymentStatus.CONFIRMED);
-            p.setConfirmedAt(evt.occurredAt() != null ? evt.occurredAt() : OffsetDateTime.now());
-            p.setEndToEndId(evt.endToEndId());
-            paymentRepo.save(p);
+        String st = evt.status() == null ? "" : evt.status().trim().toUpperCase();
 
-            // Ativa ou cria assinatura
-            var sub = subRepo.findByUserId(p.getUserId()).orElseGet(() ->
-                    Subscription.builder()
-                            .id(UUID.randomUUID())
-                            .userId(p.getUserId())
-                            .status(SubscriptionStatus.INACTIVE)
-                            .cancelAtPeriodEnd(false)
-                            .updatedAt(OffsetDateTime.now())
-                            .build()
-            );
+        switch (st) {
+            case "CONFIRMED" -> {
+                p.setStatus(PaymentStatus.CONFIRMED);
+                p.setConfirmedAt(evt.occurredAt() != null ? evt.occurredAt() : OffsetDateTime.now());
+                p.setEndToEndId(evt.endToEndId());
+                paymentRepo.save(p);
 
-            OffsetDateTime start = OffsetDateTime.now();
-            OffsetDateTime end = start.plusMonths(1);
-            sub.setCurrentPeriodStart(start);
-            sub.setCurrentPeriodEnd(end);
-            sub.setStatus(SubscriptionStatus.ACTIVE);
-            sub.setCancelAtPeriodEnd(false);
-            subRepo.save(sub);
-        } else if ("FAILED".equalsIgnoreCase(evt.status())) {
-            p.setStatus(PaymentStatus.FAILED);
-            paymentRepo.save(p);
+                // Ativar/criar assinatura
+                var sub = subRepo.findByUserId(p.getUserId()).orElseGet(() ->
+                        Subscription.builder()
+                                .id(UUID.randomUUID())
+                                .userId(p.getUserId())
+                                .status(SubscriptionStatus.INACTIVE)
+                                .cancelAtPeriodEnd(false)
+                                .updatedAt(OffsetDateTime.now())
+                                .build()
+                );
+                OffsetDateTime start = OffsetDateTime.now();
+                OffsetDateTime end = start.plusMonths(1);
+                sub.setCurrentPeriodStart(start);
+                sub.setCurrentPeriodEnd(end);
+                sub.setStatus(SubscriptionStatus.ACTIVE);
+                sub.setCancelAtPeriodEnd(false);
+                sub.setUpdatedAt(OffsetDateTime.now());
+                subRepo.save(sub);
+            }
+            case "FAILED" -> {
+                p.setStatus(PaymentStatus.FAILED);
+                paymentRepo.save(p);
+            }
+            default -> {
+                // ignore estados desconhecidos para manter idempotência
+            }
         }
         return Optional.of(p);
     }
