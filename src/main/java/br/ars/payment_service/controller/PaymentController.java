@@ -54,4 +54,12 @@ public class PaymentController {
         String subStatus = sub != null ? sub.getStatus().name() : SubscriptionStatus.INACTIVE.name();
         return ResponseEntity.ok(new StatusResponse(p.getTxid(), p.getStatus().name(), subStatus));
     }
+
+    // PaymentController.java
+    @PostMapping("/confirm/{txid}")
+    public ResponseEntity<Void> confirmManual(@PathVariable String txid) {
+        paymentService.confirmManual(txid);  // implementado abaixo
+        return ResponseEntity.noContent().build();
+    }
+
 }
