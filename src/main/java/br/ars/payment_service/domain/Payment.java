@@ -46,13 +46,12 @@ public class Payment {
     @Column(name = "status", nullable = false, length = 20)
     private PaymentStatus status;
 
-    @Lob
-    @Column(name = "pix_payload", nullable = false)
-    private String pixPayload;    // código "copia e cola"
+    @Lob @Column(name="pix_payload", nullable=false, columnDefinition = "text")
+    private String pixPayload;
 
-    @Lob
-    @Column(name = "qr_png_base64")
-    private String qrPngBase64;   // QR em base64
+    @Lob @Column(name="qr_png_base64", columnDefinition = "text")
+    private String qrPngBase64;
+
 
     @Column(name = "created_at", nullable = false)
     private OffsetDateTime createdAt;
