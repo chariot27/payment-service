@@ -1,6 +1,9 @@
 package br.ars.payment_service.service;
 
+import br.ars.payment_service.domain.Payment;
+import br.ars.payment_service.domain.PaymentStatus;
 import br.ars.payment_service.pix.QrGenerator;
+import br.ars.payment_service.repo.PaymentRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -15,13 +18,17 @@ import java.util.Locale;
 @RequiredArgsConstructor
 public class PixService {
 
-    @Value("${pix.key}")            private String pixKey;        // CHAVE PIX (EVP/telefone/e-mail/CPF) REGISTRADA
+    // ⬅️ injetamos o repo para poder verificar o status quando solicitado
+    private final PaymentRepository paymentRepo;
+
+    @Value("${pix.key}")            private String pixKey;        // CHAVE PIX (DICT)
     @Value("${pix.merchant.name}")  private String merchantName;  // máx 25 chars (ASCII)
     @Value("${pix.merchant.city}")  private String merchantCity;  // máx 15 chars (ASCII)
     @Value("${pix.amount}")         private String amountStr;     // ex: "49.90"
 
     public record PixPayload(String copiaECola, String qrBase64) {}
 
+    /** Gera payload EMV (QR estático) e QR em base64. */
     public PixPayload build(String ignoredTxid) {
         final String STATIC_TXID = "***";      // obrigatório para QR estático
         final String desc        = "ASSINATURA";
@@ -38,10 +45,21 @@ public class PixService {
         return new PixPayload(payload, qr);
     }
 
+    /**
+     * ✅ Usado por PaymentService.verifyAndMaybeConfirm(txid)
+     * Versão simples: sem integração PSP ainda, retorna o status atual no banco.
+     * (Quando integrar o PSP, troque esta lógica para consultar o provedor e mapear o retorno.)
+     */
+    public PaymentStatus checkStatus(String txid) {
+        return paymentRepo.findByTxid(txid)
+                .map(Payment::getStatus)
+                .orElse(PaymentStatus.PENDING);
+    }
+
     // ========= Helpers =========
     private static String emv(String id, String value) {
         String v = value == null ? "" : value;
-        int len = v.getBytes(StandardCharsets.UTF_8).length; // comprimento em BYTES
+        int len = v.getBytes(StandardCharsets.UTF_8).length;
         return id + String.format("%02d", len) + v;
     }
 
@@ -53,7 +71,7 @@ public class PixService {
     }
 
     private static String formatAmount(BigDecimal amount) {
-        return amount.setScale(2, RoundingMode.HALF_UP).toPlainString(); // sempre 2 casas
+        return amount.setScale(2, RoundingMode.HALF_UP).toPlainString();
     }
 
     /** QR ESTÁTICO (sem URL do PSP): 010211 */
@@ -63,21 +81,20 @@ public class PixService {
         String amt   = formatAmount(amount);
         String mDesc = desc == null ? "" : asciiUpper(desc, 25);
 
-        // Merchant Account Info (ID 26)
         String mai = emv("00", "br.gov.bcb.pix")
-                   + emv("01", key)                 // CHAVE PIX válida (DICT)
+                   + emv("01", key)
                    + (mDesc.isBlank() ? "" : emv("02", mDesc));
 
-        String base = emv("00", "01")               // Payload Format Indicator
-                    + emv("01", "11")               // <<< ESTÁTICO (CORRIGIDO)
-                    + emv("26", mai)                // MAI
-                    + emv("52", "0000")             // MCC
-                    + emv("53", "986")              // BRL
-                    + emv("54", amt)                // Valor
-                    + emv("58", "BR")               // País
-                    + emv("59", mName)              // Nome
-                    + emv("60", mCity)              // Cidade
-                    + emv("62", emv("05", txidStars)); // TXID = "***" no estático
+        String base = emv("00", "01")
+                    + emv("01", "11")
+                    + emv("26", mai)
+                    + emv("52", "0000")
+                    + emv("53", "986")
+                    + emv("54", amt)
+                    + emv("58", "BR")
+                    + emv("59", mName)
+                    + emv("60", mCity)
+                    + emv("62", emv("05", txidStars));
 
         String toCrc = base + "6304";
         return toCrc + crc16(toCrc);

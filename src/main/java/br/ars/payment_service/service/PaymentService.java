@@ -1,6 +1,7 @@
 package br.ars.payment_service.service;
 
 import br.ars.payment_service.domain.*;
+import br.ars.payment_service.dto.VerifyResponse;
 import br.ars.payment_service.dto.WebhookPixEvent;
 import br.ars.payment_service.repo.PaymentRepository;
 import br.ars.payment_service.repo.SubscriptionRepository;
@@ -84,20 +85,23 @@ public class PaymentService {
                 activateOrExtendSubscription(p.getUserId());
             }
             case "FAILED" -> {
-                // Só marca FAILED se ainda não estava confirmado
                 if (p.getStatus() != PaymentStatus.CONFIRMED) {
                     p.setStatus(PaymentStatus.FAILED);
                     paymentRepo.save(p);
                 }
             }
-            default -> {
-                // estados pendentes/desconhecidos: não altera (idempotência)
+            case "EXPIRED" -> {
+                if (p.getStatus() == PaymentStatus.PENDING) {
+                    p.setStatus(PaymentStatus.EXPIRED);
+                    paymentRepo.save(p);
+                }
             }
+            default -> { /* pendente/desconhecido: não altera (idempotência) */ }
         }
         return Optional.of(p);
     }
 
-    /** Confirmação manual para testes: usa o mesmo fluxo da confirmação do PSP. */
+    /** Confirmação manual para testes (DEV): usa o mesmo fluxo de confirmação. */
     @Transactional
     public void confirmManual(String txid) {
         var opt = paymentRepo.findByTxid(txid);
@@ -119,6 +123,42 @@ public class PaymentService {
         activateOrExtendSubscription(p.getUserId());
     }
 
+    /** ✅ Verifica no PSP e confirma se já foi pago; se não, não confirma. */
+    @Transactional
+    public VerifyResponse verifyAndMaybeConfirm(String txid) {
+        Payment p = paymentRepo.findByTxid(txid).orElseThrow();
+        PaymentStatus before = p.getStatus();
+
+        // 1) Consulta ao PSP (implemente no PixService)
+        PaymentStatus pspStatus = pixService.checkStatus(txid); // PENDING | CONFIRMED | FAILED | EXPIRED
+
+        // 2) Atualiza conforme o retorno do PSP (idempotente)
+        if (pspStatus == PaymentStatus.CONFIRMED && before != PaymentStatus.CONFIRMED) {
+            p.setStatus(PaymentStatus.CONFIRMED);
+            p.setConfirmedAt(OffsetDateTime.now());
+            paymentRepo.save(p);
+            activateOrExtendSubscription(p.getUserId());
+        } else if ((pspStatus == PaymentStatus.FAILED || pspStatus == PaymentStatus.EXPIRED)
+                && before == PaymentStatus.PENDING) {
+            p.setStatus(pspStatus);
+            paymentRepo.save(p);
+        }
+
+        // 3) Se passou do expiresAt e ainda PENDING, marca EXPIRED
+        if (p.getStatus() == PaymentStatus.PENDING
+                && p.getExpiresAt() != null
+                && p.getExpiresAt().isBefore(OffsetDateTime.now())) {
+            p.setStatus(PaymentStatus.EXPIRED);
+            paymentRepo.save(p);
+        }
+
+        var sub = subRepo.findByUserId(p.getUserId()).orElse(null);
+        String subStatus = sub != null ? sub.getStatus().name() : SubscriptionStatus.INACTIVE.name();
+        boolean changed = p.getStatus() != before;
+
+        return new VerifyResponse(p.getTxid(), p.getStatus().name(), subStatus, changed);
+    }
+
     /** Cria/ativa assinatura por +1 mês a partir de agora, limpando cancelAtPeriodEnd. */
     private void activateOrExtendSubscription(UUID userId) {
         Subscription sub = subRepo.findByUserId(userId).orElseGet(() ->
@@ -131,8 +171,6 @@ public class PaymentService {
                         .build()
         );
 
-        // Política simples: renova a partir de agora por +1 mês.
-        // (Se quiser, pode checar se currentPeriodEnd é futura e estender a partir dela.)
         OffsetDateTime start = OffsetDateTime.now();
         OffsetDateTime end   = start.plusMonths(1);
 

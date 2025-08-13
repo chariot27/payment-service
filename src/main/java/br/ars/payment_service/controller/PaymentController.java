@@ -1,7 +1,6 @@
 package br.ars.payment_service.controller;
 
 import br.ars.payment_service.domain.Payment;
-import br.ars.payment_service.domain.PaymentStatus;
 import br.ars.payment_service.domain.SubscriptionStatus;
 import br.ars.payment_service.dto.*;
 import br.ars.payment_service.repo.PaymentRepository;
@@ -15,7 +14,6 @@ import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Optional;
-import java.util.UUID;
 
 @Slf4j
 @RestController
@@ -37,14 +35,19 @@ public class PaymentController {
         ));
     }
 
-    /** Webhook genérico: aponte aqui o PSP/banco para confirmar o PIX. */
+    /** (opcional) Webhook legado aqui — se ainda usa: */
     @PostMapping(value="/webhook", consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<?> webhook(@RequestBody WebhookPixEvent evt,
                                      @RequestHeader(value="X-Signature", required=false) String sig) {
-        // Se quiser autenticar o webhook por shared secret/HMAC, valide "sig" aqui.
         Optional<Payment> opt = paymentService.confirmPayment(evt);
         if (opt.isEmpty()) return ResponseEntity.status(HttpStatus.NOT_FOUND).body("txid not found");
         return ResponseEntity.ok().build();
+    }
+
+    /** ✅ Endpoint de verificação ativa: consulta PSP (via PixService.checkStatus) e atualiza se pago */
+    @GetMapping("/verify/{txid}")
+    public ResponseEntity<VerifyResponse> verify(@PathVariable String txid) {
+        return ResponseEntity.ok(paymentService.verifyAndMaybeConfirm(txid));
     }
 
     @GetMapping("/status/{txid}")
@@ -55,11 +58,10 @@ public class PaymentController {
         return ResponseEntity.ok(new StatusResponse(p.getTxid(), p.getStatus().name(), subStatus));
     }
 
-    // PaymentController.java
+    /** DEV: confirmação manual */
     @PostMapping("/confirm/{txid}")
     public ResponseEntity<Void> confirmManual(@PathVariable String txid) {
-        paymentService.confirmManual(txid);  // implementado abaixo
+        paymentService.confirmManual(txid);
         return ResponseEntity.noContent().build();
     }
-
 }
