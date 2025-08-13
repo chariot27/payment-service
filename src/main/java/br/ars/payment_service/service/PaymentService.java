@@ -105,4 +105,34 @@ public class PaymentService {
         }
         return Optional.of(p);
     }
+
+    // PaymentService.java
+    @Transactional
+    public void confirmManual(String txid) {
+        var p = paymentRepo.findByTxid(txid).orElseThrow();
+        if (p.getStatus() != PaymentStatus.CONFIRMED) {
+            p.setStatus(PaymentStatus.CONFIRMED);
+            p.setConfirmedAt(OffsetDateTime.now());
+            paymentRepo.save(p);
+            // reaproveita sua lógica de ativação de assinatura
+            var sub = subRepo.findByUserId(p.getUserId()).orElseGet(() ->
+                Subscription.builder()
+                    .id(UUID.randomUUID())
+                    .userId(p.getUserId())
+                    .status(SubscriptionStatus.INACTIVE)
+                    .cancelAtPeriodEnd(false)
+                    .updatedAt(OffsetDateTime.now())
+                    .build()
+            );
+            var start = OffsetDateTime.now();
+            var end   = start.plusMonths(1);
+            sub.setCurrentPeriodStart(start);
+            sub.setCurrentPeriodEnd(end);
+            sub.setStatus(SubscriptionStatus.ACTIVE);
+            sub.setCancelAtPeriodEnd(false);
+            sub.setUpdatedAt(OffsetDateTime.now());
+            subRepo.save(sub);
+        }
+    }
+
 }
