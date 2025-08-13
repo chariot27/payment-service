@@ -3,12 +3,14 @@ package br.ars.payment_service.controller;
 import br.ars.payment_service.domain.Subscription;
 import br.ars.payment_service.domain.SubscriptionStatus;
 import br.ars.payment_service.service.SubscriptionService;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonInclude.Include;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.Map;
-import java.util.Optional;
+import java.time.OffsetDateTime;
 import java.util.UUID;
 
 @RestController
@@ -18,21 +20,32 @@ public class SubscriptionController {
 
     private final SubscriptionService subService;
 
-    @GetMapping("/{userId}/status")
-    public ResponseEntity<Map<String, Object>> getStatus(@PathVariable UUID userId) {
-        Optional<Subscription> s = subService.getByUser(userId);
-        return ResponseEntity.ok(Map.of(
-                "userId", userId,
-                "status", s.map(x->x.getStatus().name()).orElse(SubscriptionStatus.INACTIVE.name()),
-                "currentPeriodStart", s.map(Subscription::getCurrentPeriodStart).orElse(null),
-                "currentPeriodEnd",   s.map(Subscription::getCurrentPeriodEnd).orElse(null),
-                "cancelAtPeriodEnd",  s.map(Subscription::isCancelAtPeriodEnd).orElse(false)
-        ));
+    @GetMapping(value = "/{userId}/status", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<SubscriptionStatusResponse> getStatus(@PathVariable UUID userId) {
+        Subscription s = subService.getByUser(userId).orElse(null);
+
+        var dto = new SubscriptionStatusResponse(
+                userId,
+                s != null ? s.getStatus() : SubscriptionStatus.INACTIVE,
+                s != null ? s.getCurrentPeriodStart() : null,
+                s != null ? s.getCurrentPeriodEnd()   : null,
+                s != null && s.isCancelAtPeriodEnd()
+        );
+        return ResponseEntity.ok(dto);
     }
 
-    @PostMapping("/{userId}/cancel-at-period-end")
-    public ResponseEntity<?> cancelAtPeriodEnd(@PathVariable UUID userId) {
-        subService.cancelAtPeriodEnd(userId);
+    @PostMapping(value = "/{userId}/cancel-at-period-end")
+    public ResponseEntity<Void> cancelAtPeriodEnd(@PathVariable UUID userId) {
+        subService.cancelAtPeriodEnd(userId); // se não existir, o service decide (404 ou no-op)
         return ResponseEntity.ok().build();
     }
+
+    @JsonInclude(Include.NON_NULL)
+    public record SubscriptionStatusResponse(
+            UUID userId,
+            SubscriptionStatus status,          // serializa como "ACTIVE", "INACTIVE", etc.
+            OffsetDateTime currentPeriodStart,  // pode ser null
+            OffsetDateTime currentPeriodEnd,    // pode ser null
+            boolean cancelAtPeriodEnd
+    ) {}
 }
