@@ -8,7 +8,6 @@ import org.hibernate.annotations.UuidGenerator;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
-import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 
 @Entity
@@ -27,43 +26,46 @@ public class Payment {
 
   @Id
   @UuidGenerator
-  @Column(name = "id", columnDefinition = "uuid")
+  @Column(name = "id", nullable = false, updatable = false, columnDefinition = "uuid")
   private UUID id;
 
-  @Column(name = "user_id", nullable=false, columnDefinition = "uuid")
+  @Column(name = "user_id", nullable = false, columnDefinition = "uuid")
   private UUID userId;
 
-  @Column(nullable=false, unique=true, length=35)
+  @Column(nullable = false, unique = true, length = 35)
   private String txid;
 
-  @Column(name = "end_to_end_id", length=50)
+  @Column(name = "end_to_end_id", length = 50)
   private String endToEndId;
 
-  @Column(nullable=false, precision=12, scale=2)
+  @Column(nullable = false, precision = 12, scale = 2)
   private BigDecimal amount;
 
   @Enumerated(EnumType.STRING)
-  @Column(nullable=false, length=20)
+  @Column(nullable = false, length = 20)
   private PaymentStatus status;
 
-  @Lob @Column(name="pix_payload", nullable=false)
+  // ⚠️ TEXT em vez de LOB para evitar LO API/auto-commit
+  @Column(name = "pix_payload", nullable = false, columnDefinition = "text")
   private String pixPayload;
 
-  @Lob @Column(name="qr_png_base64")
+  @Column(name = "qr_png_base64", columnDefinition = "text")
   private String qrPngBase64;
 
-  @Column(name="created_at", nullable=false)
+  @Column(name = "created_at", nullable = false)
   private OffsetDateTime createdAt;
 
-  @Column(name="confirmed_at")
+  @Column(name = "confirmed_at")
   private OffsetDateTime confirmedAt;
 
-  @Column(name="expires_at", nullable=false)
+  @Column(name = "expires_at", nullable = false)
   private OffsetDateTime expiresAt;
 
   @Version
   private long version;
 
   @PrePersist
-  public void onCreate() { this.createdAt = OffsetDateTime.now(); }
+  public void onCreate() {
+    if (this.createdAt == null) this.createdAt = OffsetDateTime.now();
+  }
 }

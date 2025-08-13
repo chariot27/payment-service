@@ -2,6 +2,8 @@ package br.ars.payment_service.service;
 
 import br.ars.payment_service.pix.BrCodeBuilder;
 import br.ars.payment_service.pix.QrGenerator;
+import lombok.RequiredArgsConstructor;
+
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
