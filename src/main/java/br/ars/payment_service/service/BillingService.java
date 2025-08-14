@@ -7,6 +7,7 @@ import com.stripe.model.EphemeralKey;
 import com.stripe.model.Invoice;
 import com.stripe.model.PaymentIntent;
 import com.stripe.model.Subscription;
+import com.stripe.net.RequestOptions;
 import com.stripe.param.SubscriptionCreateParams;
 import com.stripe.param.SubscriptionUpdateParams;
 import org.slf4j.Logger;
@@ -82,15 +83,10 @@ public class BillingService {
     PaymentIntent pi = latestInvoice != null ? latestInvoice.getPaymentIntentObject() : null;
     String paymentIntentClientSecret = (pi != null) ? pi.getClientSecret() : null;
 
-    // 4) Ephemeral Key — **nessa versão passe a versão no params**
-    Map<String, Object> ekParams = new HashMap<>();
-    ekParams.put("customer", customerId);
-    // algumas versões aceitam 'stripe_version', outras 'api_version'.
-    // Coloque ambos para máxima compatibilidade:
-    ekParams.put("stripe_version", "2020-08-27");
-    ekParams.put("api_version",    "2020-08-27");
-
-    EphemeralKey ek = EphemeralKey.create(ekParams); // sem RequestOptions
+    RequestOptions ekOpts = RequestOptions.builder()
+    .setStripeVersionOverride(stripeVersion)
+    .build();
+    EphemeralKey ek = EphemeralKey.create(ekParams, ekOpts);
 
     return new SubscribeResponse(
         stripePublishableKey,
