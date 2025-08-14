@@ -33,7 +33,7 @@ public class PixWebhookController {
     /** DEV: confirma um txid manualmente (simula PSP). */
     @PostMapping("/_test/confirm/{txid}")
     public ResponseEntity<Void> confirmForTest(@PathVariable String txid) {
-        var evt = new WebhookPixEvent(txid, "E2E-"+txid, "CONFIRMED", java.time.OffsetDateTime.now(), "ASSINATURA");
+        var evt = new WebhookPixEvent(txid, "E2E-"+txid, "CONFIRMED", java.time.OffsetDateTime.now(), "Assinatura Premium | TXID: " + txid );
         var opt = paymentService.confirmPayment(evt);
         return opt.isPresent() ? ResponseEntity.ok().build() : ResponseEntity.notFound().build();
     }
