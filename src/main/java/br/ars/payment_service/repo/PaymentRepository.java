@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -20,4 +21,6 @@ public interface PaymentRepository extends JpaRepository<Payment, UUID> {
     Optional<Payment> findFirstByStatusAndAmountAndExpiresAtAfterOrderByExpiresAtDesc(
             PaymentStatus status, BigDecimal amount, OffsetDateTime now
     );
+
+    List<Payment> findByStatusAndExpiresAtBefore(PaymentStatus status, OffsetDateTime when);
 }
