@@ -31,7 +31,7 @@ dependencies {
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     
-    implementation "com.stripe:stripe-java:26.+"   // versão recente
+    implementation "com.stripe:stripe-java:27.+"   // versão recente
 
     // 👇 NECESSÁRIO para HttpSecurity / SecurityFilterChain
     implementation 'org.springframework.boot:spring-boot-starter-security'

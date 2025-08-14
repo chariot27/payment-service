@@ -85,10 +85,12 @@ public class BillingService {
     // 4) Ephemeral Key — **nessa versão passe a versão no params**
     Map<String, Object> ekParams = new HashMap<>();
     ekParams.put("customer", customerId);
-    ekParams.put("stripe_version", stripeVersion); // 👈 chave aceita por essa lib
+    // algumas versões aceitam 'stripe_version', outras 'api_version'.
+    // Coloque ambos para máxima compatibilidade:
+    ekParams.put("stripe_version", stripeVersion);
+    ekParams.put("api_version",    stripeVersion);
 
-    // Nada de RequestOptions aqui
-    EphemeralKey ek = EphemeralKey.create(ekParams);
+    EphemeralKey ek = EphemeralKey.create(ekParams); // sem RequestOptions
 
     return new SubscribeResponse(
         stripePublishableKey,
