@@ -87,8 +87,8 @@ public class BillingService {
     ekParams.put("customer", customerId);
     // algumas versões aceitam 'stripe_version', outras 'api_version'.
     // Coloque ambos para máxima compatibilidade:
-    ekParams.put("stripe_version", stripeVersion);
-    ekParams.put("api_version",    stripeVersion);
+    ekParams.put("stripe_version", "2020-08-27");
+    ekParams.put("api_version",    "2020-08-27");
 
     EphemeralKey ek = EphemeralKey.create(ekParams); // sem RequestOptions
 
