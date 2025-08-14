@@ -7,7 +7,6 @@ import org.springframework.web.bind.annotation.CrossOrigin;
 
 @SpringBootApplication
 @EnableScheduling
-@CrossOrigin(allowCredentials = "*")
 public class PaymentServiceApplication {
 
 	public static void main(String[] args) {
