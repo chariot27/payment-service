@@ -56,10 +56,10 @@ public class BillingService {
     log.info("[BILL][FLOW] startSubscription userId={}, email={}, priceId={}, stripeVersion={}",
         userId, email, priceId, stripeVersion);
 
-    // 1) Customer no Stripe (persistir/obter do seu repositório)
+    // 1) Customer (cria/recupera e persiste no seu BD)
     final String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
 
-    // 2) Cria assinatura INCOMPLETE (PaymentSheet confirmará)
+    // 2) Cria assinatura INCOMPLETE (PaymentSheet vai confirmar)
     final SubscriptionCreateParams subParams = SubscriptionCreateParams.builder()
         .setCustomer(customerId)
         .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
@@ -70,23 +70,24 @@ public class BillingService {
                     SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION)
                 .build()
         )
+        // Mantemos expand para compatibilidade, mas não dependemos dele para obter o client_secret
         .addExpand("latest_invoice.payment_intent")
         .build();
 
     final Subscription subscription = Subscription.create(subParams);
     final String subscriptionId = subscription.getId();
 
-    // 3) Em stripe-java 29.x: o client_secret vem em Invoice#confirmation_secret
+    // 3) Em stripe-java 29.x: o client_secret vem de Invoice#confirmation_secret
     String paymentIntentClientSecret = null;
     final Invoice latestInvoice = subscription.getLatestInvoiceObject();
     if (latestInvoice != null && latestInvoice.getConfirmationSecret() != null) {
       paymentIntentClientSecret = latestInvoice.getConfirmationSecret().getClientSecret();
     }
 
-    // 4) Ephemeral Key — OBRIGATÓRIO enviar stripe_version nos params
+    // 4) Ephemeral Key — **OBRIGATÓRIO** enviar stripe_version (ou setStripeVersion) nos params
     final EphemeralKeyCreateParams ekParams = EphemeralKeyCreateParams.builder()
         .setCustomer(customerId)
-        .setStripeVersion(stripeVersion) // <- chave correta para o SDK 29.x
+        .setStripeVersion(stripeVersion) // <- isto evita o IllegalArgumentException
         .build();
 
     final EphemeralKey ek = EphemeralKey.create(ekParams);
@@ -102,11 +103,11 @@ public class BillingService {
 
   public SubscriptionStatusResponse getStatus(String subscriptionId) throws StripeException {
     Stripe.apiKey = stripeSecretKey;
-    final Subscription sub = Subscription.retrieve(subscriptionId);
 
+    final Subscription sub = Subscription.retrieve(subscriptionId);
     final SubscriptionBackendStatus status = mapStatus(sub);
 
-    // Algumas versões do SDK não expõem current_period_end → mantemos null
+    // Algumas versões beta não expõem current_period_end → mantemos null (campo é opcional no seu DTO)
     final String currentPeriodEndIso = null;
 
     boolean cancelAtPeriodEnd = false;
@@ -129,7 +130,9 @@ public class BillingService {
     final SubscriptionUpdateParams.Builder b = SubscriptionUpdateParams.builder();
 
     final SubscriptionUpdateParams.ProrationBehavior pb = parseProration(prorationBehaviorRaw);
-    if (pb != null) b.setProrationBehavior(pb);
+    if (pb != null) {
+      b.setProrationBehavior(pb);
+    }
 
     if (itemId != null) {
       b.addItem(SubscriptionUpdateParams.Item.builder()
@@ -142,24 +145,25 @@ public class BillingService {
           .build());
     }
 
+    // Em 29.x o update continua sendo de instância
     final Subscription updated = sub.update(b.build());
     log.info("[BILL][CHANGE_PLAN] subscriptionId={}, status={}", updated.getId(), updated.getStatus());
   }
 
-  public void applyWebhookUpdate(Subscription sub, Invoice inv) {
+  public void applyWebhookUpdate(Subscription sub, Invoice inv /* pode ser null */) {
     try {
       final String subIdSafe = (sub != null) ? sub.getId() : null;
       final String invId = (inv != null) ? inv.getId() : null;
       final SubscriptionBackendStatus status = (sub != null) ? mapStatus(sub) : SubscriptionBackendStatus.INACTIVE;
 
       log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
-      // TODO: persistir no seu repositório local
+      // TODO: persistir no seu repositório local (status, invoiceId, etc.)
     } catch (Exception e) {
       log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
   }
 
-  // ---- helpers ----
+  // ---------------- helpers ----------------
 
   private static String require(String v, String field) {
     if (!StringUtils.hasText(v)) throw new IllegalArgumentException(field + " é obrigatório");
