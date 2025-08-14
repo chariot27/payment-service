@@ -1,12 +1,13 @@
-// src/main/java/br/ars/payment_service/controller/PixWebhookController.java
 package br.ars.payment_service.controller;
 
 import br.ars.payment_service.dto.WebhookPixEvent;
 import br.ars.payment_service.service.PaymentService;
 import lombok.RequiredArgsConstructor;
-import org.springframework.http.ResponseEntity;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/pix")
 @RequiredArgsConstructor
@@ -14,18 +15,21 @@ public class PixWebhookController {
 
     private final PaymentService paymentService;
 
-    // Versão simples (sem HMAC). O PSP POSTA aqui quando o PIX cai.
-    @PostMapping("/webhook")
-    public ResponseEntity<Void> receive(@RequestBody WebhookPixEvent evt) {
-        paymentService.confirmPayment(evt); // <- isso marca CONFIRMED e ativa a assinatura
+    /** Endpoint para o PSP postar o evento de PIX (sem HMAC nesta versão). */
+    @PostMapping(value = "/webhook", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> receive(@RequestBody WebhookPixEvent evt) {
+        var opt = paymentService.confirmPayment(evt);
+        if (opt.isEmpty()) {
+            // 202 para não forçar retry agressivo do PSP quando ainda não casamos o evento
+            return ResponseEntity.status(HttpStatus.ACCEPTED).body("payment not found for event");
+        }
         return ResponseEntity.ok().build();
     }
 
-    // ÚTIL PARA TESTE manual (sem PSP): confirma um txid na hora
+    /** TESTE manual (sem PSP): confirma um txid diretamente. */
     @PostMapping("/_test/confirm/{txid}")
     public ResponseEntity<Void> confirmForTest(@PathVariable String txid) {
-        var evt = new WebhookPixEvent(txid, "E2E-"+txid, "CONFIRMED", java.time.OffsetDateTime.now(), null);
-        paymentService.confirmPayment(evt);
+        paymentService.confirmManual(txid);
         return ResponseEntity.ok().build();
     }
 }
