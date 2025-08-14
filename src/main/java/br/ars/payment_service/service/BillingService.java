@@ -19,8 +19,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
-import java.util.Objects;
-
 @Service
 public class BillingService {
 
@@ -72,7 +70,6 @@ public class BillingService {
                     SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION)
                 .build()
         )
-        // manter o expand por compatibilidade (não dependemos dele para o client_secret)
         .addExpand("latest_invoice.payment_intent")
         .build();
 
@@ -86,15 +83,13 @@ public class BillingService {
       paymentIntentClientSecret = latestInvoice.getConfirmationSecret().getClientSecret();
     }
 
-    // 4) Ephemeral Key — **OBRIGATÓRIO** enviar stripe_version nos params
-    //    Use o builder do SDK para garantir a chave correta.
+    // 4) Ephemeral Key — OBRIGATÓRIO enviar stripe_version nos params
     final EphemeralKeyCreateParams ekParams = EphemeralKeyCreateParams.builder()
         .setCustomer(customerId)
-        // Algumas versões do builder já têm setStripeVersion, mas para 100% de compat:
-        .putExtraParam("stripe_version", stripeVersion) // <- chave exata exigida
+        .setStripeVersion(stripeVersion) // <- chave correta para o SDK 29.x
         .build();
 
-    final EphemeralKey ek = EphemeralKey.create(ekParams.toMap());
+    final EphemeralKey ek = EphemeralKey.create(ekParams);
 
     return new SubscribeResponse(
         stripePublishableKey,
