@@ -1,169 +1,186 @@
 package br.ars.payment_service.service;
 
-import br.ars.payment_service.config.StripeProperties;
-import br.ars.payment_service.domain.*;
 import br.ars.payment_service.dto.*;
-import br.ars.payment_service.repo.*;
+import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
-import com.stripe.model.*;
-import com.stripe.param.*;
-import com.stripe.net.RequestOptions;
-import lombok.RequiredArgsConstructor;
+import com.stripe.model.EphemeralKey;
+import com.stripe.model.Invoice;
+import com.stripe.model.PaymentIntent;
+import com.stripe.model.Subscription;
+import com.stripe.param.SubscriptionCreateParams;
+import com.stripe.param.SubscriptionUpdateParams;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
 
-import java.time.*;
-import java.util.*;
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
 
 @Service
-@RequiredArgsConstructor
 public class BillingService {
 
-  private final StripeProperties props;
-  private final BillingCustomerRepository custRepo;
-  private final SubscriptionRecordRepository subRepo;
+  private static final Logger log = LoggerFactory.getLogger(BillingService.class);
+
+  @Value("${app.stripe.secret-key}")
+  private String stripeSecretKey;
+
+  @Value("${app.stripe.publishable-key}")
+  private String stripePublishableKey;
+
+  @Value("${app.stripe.prices.basic}")
+  private String defaultBasicPriceId;
+
+  // Versão da API usada pelo SDK mobile (RN/Android/iOS)
+  @Value("${app.stripe.mobile-api-version:2020-08-27}")
+  private String mobileApiVersionDefault;
+
+  private final BillingCustomerService billingCustomerService;
+
+  public BillingService(BillingCustomerService billingCustomerService) {
+    this.billingCustomerService = billingCustomerService;
+  }
 
   @Transactional
-  public SubscribeResponse startSubscription(SubscribeRequest in) throws StripeException {
-    // 1) Customer (recupera do seu banco se já existir)
-    BillingCustomer bc = custRepo.findByUserId(in.userId())
-        .orElseGet(() -> createCustomer(in.userId(), in.email()));
+  public SubscribeResponse startSubscription(SubscribeRequest req) throws StripeException {
+    Stripe.apiKey = stripeSecretKey;
 
-    // 2) Subscription default_incomplete + expand PaymentIntent
-    String price = (in.priceId() != null && !in.priceId().isBlank())
-        ? in.priceId() : props.pricesBasic();
+    final String userId = require(req.userId(), "userId");
+    final String email = req.email();
+    final String priceId = StringUtils.hasText(req.priceId()) ? req.priceId() : defaultBasicPriceId;
+    final String stripeVersion = StringUtils.hasText(req.stripeVersion())
+        ? req.stripeVersion() : mobileApiVersionDefault;
 
-    SubscriptionCreateParams.Builder sb = SubscriptionCreateParams.builder()
-        .setCustomer(bc.getStripeCustomerId())
-        .addItem(SubscriptionCreateParams.Item.builder().setPrice(price).build())
+    log.info("[BILL][FLOW] startSubscription userId={}, email={}, priceId={}, stripeVersion={}",
+        userId, email, priceId, stripeVersion);
+
+    // 1) Customer (cria/recupera e persiste no seu BD)
+    String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
+
+    // 2) Cria assinatura INCOMPLETE (PaymentSheet vai confirmar)
+    SubscriptionCreateParams subParams = SubscriptionCreateParams.builder()
+        .setCustomer(customerId)
+        .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
         .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
-        .addAllExpand(List.of("latest_invoice.payment_intent"))
-        .setPaymentSettings(SubscriptionCreateParams.PaymentSettings.builder()
-            .setSaveDefaultPaymentMethod(
-                SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION)
-            .build());
-
-    // trial opcional via properties
-    
-    if (in.metadata() != null && !in.metadata().isEmpty()) {
-      sb.putAllMetadata(in.metadata());
-    }
-
-    // Idempotência (evita criar 2 vezes se o usuário tocar rápido)
-    RequestOptions ro = RequestOptions.builder()
-        .setIdempotencyKey(Idem.key("sub", bc.getStripeCustomerId(), price, LocalDate.now().toString()))
+        .setPaymentSettings(
+            SubscriptionCreateParams.PaymentSettings.builder()
+                .setSaveDefaultPaymentMethod(
+                    SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION)
+                .build()
+        )
+        .addExpand("latest_invoice.payment_intent")
         .build();
 
-    Subscription sub = Subscription.create(sb.build(), ro);
+    Subscription subscription = Subscription.create(subParams);
+    String subscriptionId = subscription.getId();
 
-    // 3) Ephemeral Key (SDK mobile precisa) — com override da versão da API
-    Map<String, Object> ekParams = Map.of("customer", bc.getStripeCustomerId());
-    RequestOptions ekOpts = RequestOptions.builder()
-        
-        .build();
-    EphemeralKey ek = EphemeralKey.create(ekParams, ekOpts);
+    // 3) Pega o PI do primeiro invoice para abrir a PaymentSheet
+    Invoice latestInvoice = subscription.getLatestInvoiceObject();
+    PaymentIntent pi = latestInvoice != null ? latestInvoice.getPaymentIntentObject() : null;
+    String paymentIntentClientSecret = (pi != null) ? pi.getClientSecret() : null;
 
-    // 4) Persistência local
-    Invoice inv = sub.getLatestInvoiceObject();
-    PaymentIntent pi = (inv != null) ? inv.getPaymentIntentObject() : null;
+    // 4) Ephemeral Key — **nessa versão passe a versão no params**
+    Map<String, Object> ekParams = new HashMap<>();
+    ekParams.put("customer", customerId);
+    ekParams.put("stripe_version", stripeVersion); // 👈 chave aceita por essa lib
 
-    SubscriptionRecord rec = subRepo.findByStripeSubscriptionId(sub.getId())
-        .orElseGet(SubscriptionRecord::new);
-    rec.setCustomer(bc);
-    rec.setStripeSubscriptionId(sub.getId());
-    rec.setStatus(SubscriptionsStatus.valueOf(sub.getStatus().toUpperCase())); // <<< enum correto
-    rec.setProductId(sub.getItems().getData().get(0).getPrice().getProduct());
-    rec.setPriceId(price);
-    rec.setLatestInvoiceId(inv != null ? inv.getId() : null);
-    rec.setDefaultPaymentMethod(sub.getDefaultPaymentMethod());
-    rec.setCurrentPeriodStart(toODT(sub.getCurrentPeriodStart()));
-    rec.setCurrentPeriodEnd(toODT(sub.getCurrentPeriodEnd()));
-    rec.setCancelAt(toODT(sub.getCancelAt()));
-    rec.setCancelAtPeriodEnd(Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()));
-    subRepo.save(rec);
+    // Nada de RequestOptions aqui
+    EphemeralKey ek = EphemeralKey.create(ekParams);
 
     return new SubscribeResponse(
-        props.publishableKey(),
-        bc.getStripeCustomerId(),
-        sub.getId(),
-        (pi != null ? pi.getClientSecret() : null),
+        stripePublishableKey,
+        customerId,
+        subscriptionId,
+        paymentIntentClientSecret,
         ek.getSecret()
     );
   }
 
-  @Transactional(readOnly = true)
   public SubscriptionStatusResponse getStatus(String subscriptionId) throws StripeException {
-    SubscriptionRecord rec = subRepo.findByStripeSubscriptionId(subscriptionId)
-        .orElseThrow(() -> new IllegalArgumentException("Subscription não encontrada"));
-    return new SubscriptionStatusResponse(
-        subscriptionId, rec.getStatus(), rec.getCurrentPeriodEnd(), rec.isCancelAtPeriodEnd()
-    );
+    Stripe.apiKey = stripeSecretKey;
+    Subscription sub = Subscription.retrieve(subscriptionId);
+
+    SubscriptionBackendStatus status = mapStatus(sub);
+    String currentPeriodEndIso = (sub.getCurrentPeriodEnd() != null)
+        ? Instant.ofEpochSecond(sub.getCurrentPeriodEnd()).toString()
+        : null;
+    boolean cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd());
+
+    return new SubscriptionStatusResponse(subscriptionId, status, currentPeriodEndIso, cancelAtPeriodEnd);
   }
 
-  @Transactional
+  public void changePlan(String subscriptionId, String newPriceId, String prorationBehaviorRaw) throws StripeException {
+    Stripe.apiKey = stripeSecretKey;
+
+    // Recupera assinatura e item atual
+    Subscription sub = Subscription.retrieve(subscriptionId);
+    String itemId = (sub.getItems() != null && !sub.getItems().getData().isEmpty())
+        ? sub.getItems().getData().get(0).getId()
+        : null;
+
+    SubscriptionUpdateParams.Builder b = SubscriptionUpdateParams.builder();
+
+    // parse manual (essa versão não tem fromValue(String))
+    SubscriptionUpdateParams.ProrationBehavior pb = parseProration(prorationBehaviorRaw);
+    if (pb != null) b.setProrationBehavior(pb);
+
+    if (itemId != null) {
+      b.addItem(SubscriptionUpdateParams.Item.builder()
+          .setId(itemId)
+          .setPrice(newPriceId)
+          .build());
+    } else {
+      b.addItem(SubscriptionUpdateParams.Item.builder()
+          .setPrice(newPriceId)
+          .build());
+    }
+
+    // Em 26.13.0-beta.1 o update é de **instância**
+    Subscription updated = sub.update(b.build());
+    log.info("[BILL][CHANGE_PLAN] subscriptionId={}, status={}", updated.getId(), updated.getStatus());
+  }
+
   public void applyWebhookUpdate(Subscription sub, Invoice inv) {
-    subRepo.findByStripeSubscriptionId(sub.getId()).ifPresent(rec -> {
-      rec.setStatus(SubscriptionsStatus.valueOf(sub.getStatus().toUpperCase())); // <<< enum correto
-      rec.setLatestInvoiceId(inv != null ? inv.getId() : rec.getLatestInvoiceId());
-      rec.setDefaultPaymentMethod(sub.getDefaultPaymentMethod());
-      rec.setCurrentPeriodStart(toODT(sub.getCurrentPeriodStart()));
-      rec.setCurrentPeriodEnd(toODT(sub.getCurrentPeriodEnd()));
-      rec.setCancelAt(toODT(sub.getCancelAt()));
-      rec.setCancelAtPeriodEnd(Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()));
-      subRepo.save(rec);
-    });
-  }
-
-    @Transactional
-    public void changePlan(String subscriptionId, String newPriceId, String prorationBehavior) throws StripeException {
-        Subscription sub = Subscription.retrieve(subscriptionId);
-
-        // mapeia string → enum seguro (create_prorations | none | always_invoice)
-        SubscriptionUpdateParams.ProrationBehavior behavior = resolveProration(prorationBehavior);
-
-        SubscriptionUpdateParams params = SubscriptionUpdateParams.builder()
-            .addItem(SubscriptionUpdateParams.Item.builder()
-                .setId(sub.getItems().getData().get(0).getId())
-                .setPrice(newPriceId)
-                .build())
-            .setProrationBehavior(behavior)
-            .build();
-
-        Subscription updated = sub.update(params);
-        applyWebhookUpdate(updated, null);
-    }
-
-    /** Normaliza a string enviada e retorna o enum do Stripe. */
-    private SubscriptionUpdateParams.ProrationBehavior resolveProration(String p) {
-        if (p == null) return SubscriptionUpdateParams.ProrationBehavior.CREATE_PRORATIONS;
-        switch (p.trim().toLowerCase(Locale.ROOT)) {
-            case "none":
-            return SubscriptionUpdateParams.ProrationBehavior.NONE;
-            case "always_invoice":
-            return SubscriptionUpdateParams.ProrationBehavior.ALWAYS_INVOICE;
-            case "create_prorations":
-            default:
-            return SubscriptionUpdateParams.ProrationBehavior.CREATE_PRORATIONS;
-        }
-    }
-
-  private BillingCustomer createCustomer(UUID userId, String email) {
     try {
-      Customer cust = Customer.create(CustomerCreateParams.builder().setEmail(email).build());
-      BillingCustomer bc = BillingCustomer.builder()
-          .userId(userId)
-          .email(email)
-          .stripeCustomerId(cust.getId())
-          .build();
-      return custRepo.save(bc);
+      SubscriptionBackendStatus status = mapStatus(sub);
+      String invId = inv != null ? inv.getId() : null;
+      log.info("[BILL][WEBHOOK] subId={}, status={}, invoiceId={}", sub.getId(), status, invId);
+      // TODO: persistir no seu repositório local
     } catch (Exception e) {
-      throw new RuntimeException(e);
+      log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
   }
 
-  private OffsetDateTime toODT(Long epochSeconds) {
-    return (epochSeconds == null)
-        ? null
-        : OffsetDateTime.ofInstant(Instant.ofEpochSecond(epochSeconds), ZoneOffset.UTC);
+  // ---- helpers ----
+  private static String require(String v, String field) {
+    if (!StringUtils.hasText(v)) throw new IllegalArgumentException(field + " é obrigatório");
+    return v;
+  }
+
+  private static SubscriptionBackendStatus mapStatus(Subscription sub) {
+    if (sub == null || sub.getStatus() == null) return SubscriptionBackendStatus.INACTIVE;
+    return switch (sub.getStatus()) {
+      case "incomplete" -> SubscriptionBackendStatus.INCOMPLETE;
+      case "incomplete_expired" -> SubscriptionBackendStatus.INCOMPLETE_EXPIRED;
+      case "trialing" -> SubscriptionBackendStatus.TRIALING;
+      case "active" -> SubscriptionBackendStatus.ACTIVE;
+      case "past_due" -> SubscriptionBackendStatus.PAST_DUE;
+      case "canceled" -> SubscriptionBackendStatus.CANCELED;
+      case "unpaid" -> SubscriptionBackendStatus.UNPAID;
+      default -> SubscriptionBackendStatus.INACTIVE;
+    };
+  }
+
+  private static SubscriptionUpdateParams.ProrationBehavior parseProration(String s) {
+    if (!StringUtils.hasText(s)) return null;
+    return switch (s) {
+      case "create_prorations" -> SubscriptionUpdateParams.ProrationBehavior.CREATE_PRORATIONS;
+      case "none" -> SubscriptionUpdateParams.ProrationBehavior.NONE;
+      case "always_invoice" -> SubscriptionUpdateParams.ProrationBehavior.ALWAYS_INVOICE;
+      default -> null;
+    };
   }
 }

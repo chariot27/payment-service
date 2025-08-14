@@ -1,11 +1,9 @@
 package br.ars.payment_service.dto;
 
-import java.util.Map;
-import java.util.UUID;
-
+/** Request recebido do app/gateway para iniciar a assinatura. */
 public record SubscribeRequest(
-  UUID userId,
-  String email,
-  String priceId,              // opcional: se não vier, usa default (basic)
-  Map<String,String> metadata  // opcional
+    String userId,
+    String email,
+    String priceId,
+    String stripeVersion // versão da API do Stripe usada no mobile (ex.: "2020-08-27")
 ) {}
