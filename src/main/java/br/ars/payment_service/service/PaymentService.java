@@ -1,3 +1,4 @@
+// src/main/java/br/ars/payment_service/service/PaymentService.java
 package br.ars.payment_service.service;
 
 import br.ars.payment_service.domain.*;
@@ -42,11 +43,11 @@ public class PaymentService {
         return base.length() > 35 ? base.substring(0, 35) : base;
     }
 
-    /** Cria pagamento PENDING e devolve payload/QR estático (TXID "***" no EMV). */
+    /** Cria pagamento PENDING e devolve payload/QR (se usar QR estático, TXID no EMV será "***"). */
     @Transactional
     public Payment createCheckout(UUID userId) {
         String txid = newTxid();
-        var pix = pixService.build(txid);
+        var pix = pixService.build(txid); // se usar QR dinâmico no PSP, esse método deve chamar a API do PSP
 
         Payment p = Payment.builder()
                 .userId(userId)
@@ -64,69 +65,71 @@ public class PaymentService {
 
     /**
      * ✅ Confirmação vinda do PSP (webhook).
-     * Localiza por:
+     * Tenta localizar por:
      *  1) txid (se não for "***")
      *  2) endToEndId
-     *  3) PENDING mais recente de 49.90 contendo "ASSINATURA" no payload
-     * Idempotente.
+     *  3) PENDING mais recente do valor configurado (49.90) ainda válido
+     * Idempotente e robusto para QR estático.
      */
     @Transactional
     public Optional<Payment> confirmPayment(WebhookPixEvent evt) {
         if (evt == null) return Optional.empty();
 
-        String evtTxid = safeStr(evt.getTxid());
-        String evtE2e  = safeStr(evt.getEndToEndId());
-        String evtSt   = safeStr(evt.getStatus());
-        OffsetDateTime evtWhen = evt.getOccurredAt();
-
-        log.info("[PIX WEBHOOK] payload: txid={}, e2e={}, status={}, occurredAt={}",
-                evtTxid, evtE2e, evtSt, evtWhen);
+        log.info("[PIX WEBHOOK] payload: txid={}, e2e={}, status={}, occurredAt={}, desc={}",
+                safe(evt.txid()), safe(evt.endToEndId()), safe(evt.status()), evt.occurredAt(), safe(evt.description()));
 
         Payment p = null;
 
-        // (1) por txid (ignora "***")
-        if (!evtTxid.isBlank() && !"***".equals(evtTxid)) {
-            p = paymentRepo.findByTxid(evtTxid).orElse(null);
+        // 1) tenta por txid (ignora "***")
+        String tx = safe(evt.txid());
+        if (!tx.isBlank() && !"***".equals(tx)) {
+            p = paymentRepo.findByTxid(tx).orElse(null);
         }
 
-        // (2) por endToEndId
-        if (p == null && !evtE2e.isBlank()) {
-            p = paymentRepo.findAll().stream()
-                    .filter(x -> evtE2e.equals(safeStr(x.getEndToEndId())))
-                    .findFirst()
-                    .orElse(null);
+        // 2) tenta por endToEndId (se houver)
+        if (p == null) {
+            String e2e = safe(evt.endToEndId());
+            if (!e2e.isBlank()) {
+                p = paymentRepo.findAll().stream()
+                        .filter(x -> e2e.equals(safe(x.getEndToEndId())))
+                        .findFirst().orElse(null);
+            }
         }
 
-        // (3) fallback por valor + descrição "ASSINATURA" + PENDING válido
+        // 3) fallback por valor + status PENDING + não expirado
         if (p == null) {
             BigDecimal expected = new BigDecimal(amountStr);
             OffsetDateTime now = OffsetDateTime.now();
             p = paymentRepo.findAll().stream()
                     .filter(x -> x.getStatus() == PaymentStatus.PENDING)
                     .filter(x -> x.getAmount() != null && expected.compareTo(x.getAmount()) == 0)
-                    .filter(x -> hasAssinatura(x.getPixPayload()))
                     .filter(x -> x.getExpiresAt() == null || x.getExpiresAt().isAfter(now))
                     .max(Comparator.comparing(Payment::getExpiresAt, Comparator.nullsLast(Comparator.naturalOrder())))
                     .orElse(null);
         }
 
         if (p == null) {
-            log.warn("[PIX WEBHOOK] pagamento não localizado (txid={}, e2e={})", evtTxid, evtE2e);
+            log.warn("[PIX WEBHOOK] pagamento NÃO localizado (txid={}, e2e={})", tx, safe(evt.endToEndId()));
             return Optional.empty();
         }
 
-        // Idempotência: já confirmado
+        // Idempotência
         if (p.getStatus() == PaymentStatus.CONFIRMED) {
             activateOrExtendSubscription(p.getUserId());
+            log.info("[PIX WEBHOOK] já CONFIRMADO (txid={}), assinatura garantida", p.getTxid());
             return Optional.of(p);
         }
 
-        String st = evtSt.toUpperCase();
+        // Mapeia status do PSP para o nosso enum
+        String st = safe(evt.status()).toUpperCase();
+        if (st.equals("PAID")) st = "CONFIRMED"; // alguns PSPs usam "PAID"
+
         switch (st) {
             case "CONFIRMED" -> {
                 p.setStatus(PaymentStatus.CONFIRMED);
-                p.setConfirmedAt(evtWhen != null ? evtWhen : OffsetDateTime.now());
-                if (!evtE2e.isBlank()) p.setEndToEndId(evtE2e);
+                p.setConfirmedAt(evt.occurredAt() != null ? evt.occurredAt() : OffsetDateTime.now());
+                String e2e = safe(evt.endToEndId());
+                if (!e2e.isBlank()) p.setEndToEndId(e2e);
                 paymentRepo.save(p);
                 activateOrExtendSubscription(p.getUserId());
                 log.info("[PIX WEBHOOK] CONFIRMED txid={}, e2e={}", p.getTxid(), p.getEndToEndId());
@@ -145,13 +148,15 @@ public class PaymentService {
                     log.info("[PIX WEBHOOK] EXPIRED txid={}", p.getTxid());
                 }
             }
-            default -> log.info("[PIX WEBHOOK] status '{}' não aplicável. Sem alterações. txid={}", st, p.getTxid());
+            default -> {
+                log.info("[PIX WEBHOOK] status '{}' não aplicável. Sem alterações. txid={}", st, p.getTxid());
+            }
         }
 
         return Optional.of(p);
     }
 
-    /** Confirmação manual para testes (DEV). */
+    /** DEV: confirma manualmente um txid (idempotente). */
     @Transactional
     public void confirmManual(String txid) {
         var opt = paymentRepo.findByTxid(txid);
@@ -165,21 +170,20 @@ public class PaymentService {
 
         p.setStatus(PaymentStatus.CONFIRMED);
         p.setConfirmedAt(OffsetDateTime.now());
-        if (safeStr(p.getEndToEndId()).isBlank()) {
+        if (safe(p.getEndToEndId()).isBlank()) {
             p.setEndToEndId("MANUAL-" + txid);
         }
         paymentRepo.save(p);
-
         activateOrExtendSubscription(p.getUserId());
     }
 
-    /** ✅ Verifica no PSP e confirma se já foi pago; se não, não confirma. */
+    /** ✅ Consulta PSP e (talvez) confirma. */
     @Transactional
     public VerifyResponse verifyAndMaybeConfirm(String txid) {
         Payment p = paymentRepo.findByTxid(txid).orElseThrow();
         PaymentStatus before = p.getStatus();
 
-        PaymentStatus pspStatus = pixService.checkStatus(txid); // PENDING | CONFIRMED | FAILED | EXPIRED
+        PaymentStatus pspStatus = pixService.checkStatus(txid); // implementar no PixService quando usar PSP
 
         if (pspStatus == PaymentStatus.CONFIRMED && before != PaymentStatus.CONFIRMED) {
             p.setStatus(PaymentStatus.CONFIRMED);
@@ -206,7 +210,7 @@ public class PaymentService {
         return new VerifyResponse(p.getTxid(), p.getStatus().name(), subStatus, changed);
     }
 
-    /** ♻️ Reconciliação automática periódica. */
+    /** ♻️ Reconciliação automática: verifica PENDING (49.90) e atualiza status. */
     @Scheduled(
             fixedDelayString = "${pix.reconcile-interval-ms:30000}",
             initialDelayString = "${pix.reconcile-initial-delay-ms:10000}"
@@ -218,14 +222,13 @@ public class PaymentService {
         paymentRepo.findAll().stream()
                 .filter(p -> p.getStatus() == PaymentStatus.PENDING)
                 .filter(p -> p.getAmount() != null && expected.compareTo(p.getAmount()) == 0)
-                .filter(p -> hasAssinatura(p.getPixPayload()))
                 .filter(p -> p.getExpiresAt() == null || p.getExpiresAt().isAfter(now))
                 .forEach(p -> {
                     try {
                         var before = p.getStatus();
                         var v = verifyAndMaybeConfirm(p.getTxid());
-                        if (!v.changed() && before == PaymentStatus.PENDING) {
-                            // continua pendente; se expirar, verifyAndMaybeConfirm marca EXPIRED
+                        if (v.changed()) {
+                            log.info("[RECONCILE] {} -> {} (txid={})", before, p.getStatus(), p.getTxid());
                         }
                     } catch (Exception e) {
                         log.warn("[RECONCILE] Falha ao verificar txid {}: {}", p.getTxid(), e.getMessage());
@@ -233,7 +236,7 @@ public class PaymentService {
                 });
     }
 
-    /** Ativa/renova assinatura por +1 mês a partir de agora. */
+    /** Ativa/estende assinatura por +1 mês a partir de agora. */
     private void activateOrExtendSubscription(UUID userId) {
         Subscription sub = subRepo.findByUserId(userId).orElseGet(() ->
                 Subscription.builder()
@@ -257,10 +260,5 @@ public class PaymentService {
         subRepo.save(sub);
     }
 
-    private static String safeStr(String s) { return (s == null) ? "" : s.trim(); }
-
-    private static boolean hasAssinatura(String payload) {
-        if (payload == null) return false;
-        return payload.toUpperCase().contains("ASSINATURA");
-    }
+    private static String safe(String s) { return s == null ? "" : s.trim(); }
 }
