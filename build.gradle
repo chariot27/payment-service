@@ -33,6 +33,9 @@ dependencies {
     
     implementation "com.stripe:stripe-java:26.+"   // versão recente
 
+    // 👇 NECESSÁRIO para HttpSecurity / SecurityFilterChain
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+
 
 }
 
