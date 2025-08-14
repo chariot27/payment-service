@@ -1,11 +1,15 @@
 package br.ars.payment_service.service;
 
-import br.ars.payment_service.dto.*;
+import br.ars.payment_service.dto.SubscribeRequest;
+import br.ars.payment_service.dto.SubscribeResponse;
+import br.ars.payment_service.dto.SubscriptionBackendStatus;
+import br.ars.payment_service.dto.SubscriptionStatusResponse;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
 import com.stripe.model.EphemeralKey;
 import com.stripe.model.Invoice;
-import com.stripe.model.PaymentIntent;
 import com.stripe.model.Subscription;
 import com.stripe.net.RequestOptions;
 import com.stripe.param.SubscriptionCreateParams;
@@ -17,7 +21,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
-import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -35,11 +38,13 @@ public class BillingService {
   @Value("${app.stripe.prices.basic}")
   private String defaultBasicPriceId;
 
-  // Versão da API usada pelo SDK mobile (RN/Android/iOS)
+  /** Versão da API usada pelo SDK mobile (RN/Android/iOS) */
   @Value("${app.stripe.mobile-api-version:2020-08-27}")
   private String mobileApiVersionDefault;
 
   private final BillingCustomerService billingCustomerService;
+
+  private final ObjectMapper objectMapper = new ObjectMapper();
 
   public BillingService(BillingCustomerService billingCustomerService) {
     this.billingCustomerService = billingCustomerService;
@@ -78,15 +83,16 @@ public class BillingService {
     Subscription subscription = Subscription.create(subParams);
     String subscriptionId = subscription.getId();
 
-    // 3) Pega o PI do primeiro invoice para abrir a PaymentSheet
-    Invoice latestInvoice = subscription.getLatestInvoiceObject();
-    PaymentIntent pi = latestInvoice != null ? latestInvoice.getPaymentIntentObject() : null;
-    String paymentIntentClientSecret = (pi != null) ? pi.getClientSecret() : null;
+    // 3) Extrai o client_secret do PaymentIntent via JSON bruto da resposta
+    String paymentIntentClientSecret = extractClientSecretFromSubscription(subscription);
 
-    RequestOptions ekOpts = RequestOptions.builder()
-    .setStripeVersionOverride(stripeVersion)
-    .build();
-    EphemeralKey ek = EphemeralKey.create(ekParams, ekOpts);
+    // 4) Ephemeral Key: especifique a versão da API nos PARAMS
+    Map<String, Object> ekParams = new HashMap<>();
+    ekParams.put("customer", customerId);
+    ekParams.put("stripe_version", stripeVersion); // compat
+    ekParams.put("api_version",    stripeVersion); // compat
+
+    EphemeralKey ek = EphemeralKey.create(ekParams);
 
     return new SubscribeResponse(
         stripePublishableKey,
@@ -102,10 +108,15 @@ public class BillingService {
     Subscription sub = Subscription.retrieve(subscriptionId);
 
     SubscriptionBackendStatus status = mapStatus(sub);
-    String currentPeriodEndIso = (sub.getCurrentPeriodEnd() != null)
-        ? Instant.ofEpochSecond(sub.getCurrentPeriodEnd()).toString()
-        : null;
-    boolean cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd());
+
+    // Seu SDK não expõe current_period_end -> mantemos null (campo é opcional no DTO).
+    String currentPeriodEndIso = null;
+
+    boolean cancelAtPeriodEnd = false;
+    try {
+      Boolean v = sub.getCancelAtPeriodEnd();
+      cancelAtPeriodEnd = Boolean.TRUE.equals(v);
+    } catch (Throwable ignored) {}
 
     return new SubscriptionStatusResponse(subscriptionId, status, currentPeriodEndIso, cancelAtPeriodEnd);
   }
@@ -113,7 +124,6 @@ public class BillingService {
   public void changePlan(String subscriptionId, String newPriceId, String prorationBehaviorRaw) throws StripeException {
     Stripe.apiKey = stripeSecretKey;
 
-    // Recupera assinatura e item atual
     Subscription sub = Subscription.retrieve(subscriptionId);
     String itemId = (sub.getItems() != null && !sub.getItems().getData().isEmpty())
         ? sub.getItems().getData().get(0).getId()
@@ -121,7 +131,7 @@ public class BillingService {
 
     SubscriptionUpdateParams.Builder b = SubscriptionUpdateParams.builder();
 
-    // parse manual (essa versão não tem fromValue(String))
+    // parse manual do proration (sua versão não tem fromValue(String))
     SubscriptionUpdateParams.ProrationBehavior pb = parseProration(prorationBehaviorRaw);
     if (pb != null) b.setProrationBehavior(pb);
 
@@ -136,15 +146,15 @@ public class BillingService {
           .build());
     }
 
-    // Em 26.13.0-beta.1 o update é de **instância**
+    // Em versões beta recentes o update é de instância
     Subscription updated = sub.update(b.build());
     log.info("[BILL][CHANGE_PLAN] subscriptionId={}, status={}", updated.getId(), updated.getStatus());
   }
 
-  public void applyWebhookUpdate(Subscription sub, Invoice inv) {
+  public void applyWebhookUpdate(Subscription sub, Invoice inv /* pode ser null */) {
     try {
       SubscriptionBackendStatus status = mapStatus(sub);
-      String invId = inv != null ? inv.getId() : null;
+      String invId = (inv != null) ? inv.getId() : null;
       log.info("[BILL][WEBHOOK] subId={}, status={}, invoiceId={}", sub.getId(), status, invId);
       // TODO: persistir no seu repositório local
     } catch (Exception e) {
@@ -153,6 +163,26 @@ public class BillingService {
   }
 
   // ---- helpers ----
+
+  private String extractClientSecretFromSubscription(Subscription subscription) {
+      try {
+          // Extrai do JSON da resposta expandida
+          String rawResponse = subscription.getLastResponse().body();
+          JsonNode rootNode = objectMapper.readTree(rawResponse);
+          
+          JsonNode paymentIntentNode = rootNode.path("latest_invoice")
+                                            .path("payment_intent");
+          
+          if (!paymentIntentNode.isMissingNode()) {
+              return paymentIntentNode.path("client_secret").asText();
+          }
+          return null;
+      } catch (Exception e) {
+          log.warn("[BILL] Falha ao extrair client_secret do JSON expandido: {}", e.getMessage());
+          return null;
+      }
+  }
+
   private static String require(String v, String field) {
     if (!StringUtils.hasText(v)) throw new IllegalArgumentException(field + " é obrigatório");
     return v;

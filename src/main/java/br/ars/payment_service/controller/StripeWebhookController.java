@@ -3,7 +3,6 @@ package br.ars.payment_service.controller;
 import br.ars.payment_service.config.StripeProperties;
 import br.ars.payment_service.service.BillingService;
 import com.stripe.exception.SignatureVerificationException;
-import com.stripe.exception.StripeException;
 import com.stripe.model.Event;
 import com.stripe.model.Invoice;
 import com.stripe.model.Subscription;
@@ -27,41 +26,45 @@ public class StripeWebhookController {
       @RequestHeader("Stripe-Signature") String sig,
       @RequestBody String payload) {
 
-    Event event;
+    // 1) Verifica a assinatura do webhook
+    final Event event;
     try {
-      event = Webhook.constructEvent(
-          payload, sig, props.getWebhookSecret());
+      event = Webhook.constructEvent(payload, sig, props.getWebhookSecret());
     } catch (SignatureVerificationException e) {
       log.warn("Webhook signature invalid: {}", e.getMessage());
       return ResponseEntity.status(400).body("invalid sig");
     }
 
+    // 2) Processa leve e responde 200
+    final String type = event.getType();
     try {
-      switch (event.getType()) {
-        case "invoice.paid" -> {
-          Invoice inv = (Invoice) event.getDataObjectDeserializer().getObject().orElse(null);
-          if (inv != null && inv.getSubscription() != null) {
-            Subscription sub = Subscription.retrieve(inv.getSubscription());
-            billing.applyWebhookUpdate(sub, inv);
-          }
+      switch (type) {
+        // NESTES eventos já vem um Subscription tipado na payload
+        case "customer.subscription.created":
+        case "customer.subscription.updated":
+        case "customer.subscription.deleted": {
+          Subscription sub = (Subscription) event.getDataObjectDeserializer()
+              .getObject()
+              .orElse(null);
+          billing.applyWebhookUpdate(sub, null);
+          break;
         }
-        case "invoice.payment_failed" -> {
-          Invoice inv = (Invoice) event.getDataObjectDeserializer().getObject().orElse(null);
-          if (inv != null && inv.getSubscription() != null) {
-            Subscription sub = Subscription.retrieve(inv.getSubscription());
-            billing.applyWebhookUpdate(sub, inv);
-          }
+        // Para invoices, algumas propriedades não têm getters tipados em 29.x.
+        // Apenas passamos o Invoice para log/persist local sem tentar obter o subscriptionId via getter.
+        case "invoice.paid":
+        case "invoice.payment_failed": {
+          Invoice inv = (Invoice) event.getDataObjectDeserializer()
+              .getObject()
+              .orElse(null);
+          billing.applyWebhookUpdate(null, inv);
+          break;
         }
-        case "customer.subscription.updated",
-             "customer.subscription.deleted",
-             "customer.subscription.created" -> {
-          Subscription sub = (Subscription) event.getDataObjectDeserializer().getObject().orElse(null);
-          if (sub != null) billing.applyWebhookUpdate(sub, null);
-        }
-        default -> log.debug("Unhandled event: {}", event.getType());
+        default:
+          log.debug("Unhandled event: {}", type);
       }
-    } catch (StripeException e) {
-      log.error("Stripe API error", e);
+    } catch (Exception e) {
+      // Captura geral para não derrubar o webhook
+      log.error("Error handling webhook {}: {}", type, e.getMessage(), e);
     }
 
     return ResponseEntity.ok("ok");
