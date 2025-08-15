@@ -8,19 +8,17 @@ import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
 import com.stripe.model.EphemeralKey;
 import com.stripe.model.Invoice;
-import com.stripe.model.PaymentIntent;
 import com.stripe.model.Subscription;
 import com.stripe.param.EphemeralKeyCreateParams;
 import com.stripe.param.SubscriptionCreateParams;
 import com.stripe.param.SubscriptionUpdateParams;
+import com.stripe.net.RequestOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
-
-import java.lang.reflect.Method;
 
 @Service
 public class BillingService {
@@ -46,7 +44,7 @@ public class BillingService {
     this.billingCustomerService = billingCustomerService;
   }
 
-  /** Fluxo único: Google Pay (PaymentSheet com PaymentIntent) */
+  /** Fluxo: pagar a primeira fatura da assinatura com PaymentSheet (ex.: Google Pay) */
   @Transactional
   public SubscribeResponse startSubscription(SubscribeRequest req) throws StripeException {
     Stripe.apiKey = stripeSecretKey;
@@ -56,54 +54,42 @@ public class BillingService {
     final String priceId = StringUtils.hasText(req.priceId()) ? req.priceId() : defaultBasicPriceId;
     final String stripeVersion = StringUtils.hasText(req.stripeVersion()) ? req.stripeVersion() : mobileApiVersionDefault;
 
-    log.info("[BILL][FLOW] startSubscription (GooglePay) userId={}, email={}, priceId={}, stripeVersion={}",
+    log.info("[BILL][FLOW] startSubscription (PaymentSheet/PI) userId={}, email={}, priceId={}, stripeVersion={}",
         userId, email, priceId, stripeVersion);
 
-    // 1) Customer
+    // 1) Customer único por userId
     final String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
 
-    // 2) Assinatura default_incomplete para gerar PI na latest_invoice
-    final SubscriptionCreateParams params = SubscriptionCreateParams.builder()
-        .setCustomer(customerId)
-        .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
-        .setCollectionMethod(SubscriptionCreateParams.CollectionMethod.CHARGE_AUTOMATICALLY)
-        .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
-        .setPaymentSettings(
-            SubscriptionCreateParams.PaymentSettings.builder()
-                .setSaveDefaultPaymentMethod(
-                    SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION
-                ).build()
-        )
-        .addExpand("latest_invoice")
-        .addExpand("latest_invoice.payment_intent")
+    // 2) Criar assinatura no modo DEFAULT_INCOMPLETE p/ gerar PI na latest_invoice
+    final SubscriptionCreateParams createParams = SubscriptionCreateParams
+        .builder()
+          .setCustomer(customerId)
+          .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
+          .setCollectionMethod(SubscriptionCreateParams.CollectionMethod.CHARGE_AUTOMATICALLY)
+          .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
+          .setPaymentSettings(
+              SubscriptionCreateParams.PaymentSettings.builder()
+                  .setSaveDefaultPaymentMethod(
+                      SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION
+                  )
+                  .build()
+          )
+          // essas expansões ajudam, mas não são estritamente necessárias se usamos confirmation_secret
+          .addExpand("latest_invoice")
         .build();
 
-    final Subscription subscription = Subscription.create(params);
+    // Idempotência para proteger toques repetidos
+    final String idempotencyKey = "sub:create:" + userId + ":" + priceId;
+    final RequestOptions ro = RequestOptions.builder().setIdempotencyKey(idempotencyKey).build();
+
+    final Subscription subscription = Subscription.create(createParams, ro);
     final String subscriptionId = subscription.getId();
 
-    // 3) Extrair PaymentIntent da latest_invoice (compatível via reflexão)
-    String paymentIntentClientSecret = null;
-    Invoice inv = null;
-    try { inv = subscription.getLatestInvoiceObject(); } catch (Throwable ignored) {}
-    if (inv == null) {
-      try {
-        String invId = subscription.getLatestInvoice();
-        if (StringUtils.hasText(invId)) inv = Invoice.retrieve(invId);
-      } catch (Throwable ignored) {}
-    }
-    if (inv != null) {
-      try {
-        Method m = Invoice.class.getMethod("getPaymentIntent"); // retorna String id
-        Object idObj = m.invoke(inv);
-        if (idObj instanceof String piId && StringUtils.hasText(piId)) {
-          PaymentIntent pi = PaymentIntent.retrieve(piId);
-          paymentIntentClientSecret = pi.getClientSecret();
-        }
-      } catch (Throwable ignored) { /* fallback não necessário aqui */ }
-    }
+    // 3) Extraia o client_secret do PI da latest_invoice via confirmation_secret
+    String paymentIntentClientSecret = fetchPiClientSecretFromLatestInvoice(subscription);
 
-    // 4) Ephemeral Key com versão da API para o app
-    EphemeralKey ek = EphemeralKey.create(
+    // 4) Ephemeral Key para o app, usando a Stripe-Version “presa” ao SDK mobile
+    final EphemeralKey ek = EphemeralKey.create(
         EphemeralKeyCreateParams.builder()
             .setCustomer(customerId)
             .setStripeVersion(stripeVersion)
@@ -117,11 +103,50 @@ public class BillingService {
         stripePublishableKey,
         customerId,
         subscriptionId,
-        paymentIntentClientSecret, // usado pelo PaymentSheet (Google Pay)
+        paymentIntentClientSecret, // PaymentSheet vai usar este secret
         ek.getSecret(),
-        null, // setupIntentClientSecret (não usado neste fluxo)
-        null  // hostedInvoiceUrl (não aplicável)
+        null,  // setupIntentClientSecret (não usado neste fluxo)
+        null   // hostedInvoiceUrl   (não aplicável neste fluxo)
     );
+  }
+
+  /** Tenta pegar o client_secret imediatamente; se não houver, faz um polling curto. */
+  private String fetchPiClientSecretFromLatestInvoice(Subscription sub) throws StripeException {
+    Invoice inv = null;
+    try { inv = sub.getLatestInvoiceObject(); } catch (Throwable ignored) {}
+    if (inv == null) {
+      final String invId = sub.getLatestInvoice();
+      if (StringUtils.hasText(invId)) {
+        inv = Invoice.retrieve(invId);
+      }
+    }
+    if (inv == null) return null;
+
+    // 1ª tentativa: direto
+    String secret = extractClientSecret(inv);
+    if (StringUtils.hasText(secret)) return secret;
+
+    // Polling curto: aguarda a finalização da fatura/PI
+    final String invId = inv.getId();
+    final int maxAttempts = 6;       // ~2s
+    final long sleepMs = 350L;
+    for (int i = 0; i < maxAttempts; i++) {
+      try { Thread.sleep(sleepMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+      Invoice refreshed = Invoice.retrieve(invId);
+      secret = extractClientSecret(refreshed);
+      if (StringUtils.hasText(secret)) return secret;
+    }
+    return null;
+  }
+
+  private static String extractClientSecret(Invoice inv) {
+    try {
+      Invoice.ConfirmationSecret cs = inv.getConfirmationSecret();
+      if (cs != null && StringUtils.hasText(cs.getPaymentIntentClientSecret())) {
+        return cs.getPaymentIntentClientSecret();
+      }
+    } catch (Throwable ignored) {}
+    return null;
   }
 
   public SubscriptionStatusResponse getStatus(String subscriptionId) throws StripeException {
