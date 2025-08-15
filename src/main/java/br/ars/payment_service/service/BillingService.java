@@ -8,12 +8,10 @@ import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
 import com.stripe.model.EphemeralKey;
 import com.stripe.model.Invoice;
-import com.stripe.model.PaymentIntent;
 import com.stripe.model.SetupIntent;
 import com.stripe.model.Subscription;
 import com.stripe.net.RequestOptions;
 import com.stripe.param.EphemeralKeyCreateParams;
-import com.stripe.param.SetupIntentCreateParams;
 import com.stripe.param.SubscriptionCreateParams;
 import com.stripe.param.SubscriptionUpdateParams;
 import org.slf4j.Logger;
@@ -41,6 +39,10 @@ public class BillingService {
   @Value("${app.stripe.mobile-api-version:2020-08-27}")
   private String mobileApiVersionDefault;
 
+  /** Versão da API a ser usada pelo servidor em chamadas Stripe (override por request) */
+  @Value("${app.stripe.api-version:2023-10-16}")
+  private String serverApiVersion;
+
   private final BillingCustomerService billingCustomerService;
 
   public BillingService(BillingCustomerService billingCustomerService) {
@@ -54,38 +56,39 @@ public class BillingService {
     final String userId = require(req.userId(), "userId");
     final String email = req.email();
     final String priceId = StringUtils.hasText(req.priceId()) ? req.priceId() : defaultBasicPriceId;
-    final String stripeVersion = StringUtils.hasText(req.stripeVersion()) ? req.stripeVersion() : mobileApiVersionDefault;
+    final String stripeVersionMobile = StringUtils.hasText(req.stripeVersion())
+        ? req.stripeVersion() : mobileApiVersionDefault;
 
     // "auto" (cartões/carteiras/link) ou "boleto"
     final String pmMode = StringUtils.hasText(req.pmMode()) ? req.pmMode() : "auto";
     final boolean isBoleto = "boleto".equalsIgnoreCase(pmMode);
 
     log.info("[BILL][FLOW] startSubscription userId={}, email={}, priceId={}, pmMode={}, stripeVersion={}",
-        userId, email, priceId, pmMode, stripeVersion);
+        userId, email, priceId, pmMode, stripeVersionMobile);
 
     // 1) Customer único por userId
     final String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
 
-    // 2) Monta Subscription Create Params de acordo com o PM
+    // 2) Monta Subscription Create Params de acordo com o método de pagamento
     SubscriptionCreateParams.Builder sb = SubscriptionCreateParams.builder()
         .setCustomer(customerId)
         .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
+        // cria como incomplete para permitir confirmação no front
         .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
-        // Expansões para SDKs que suportam object accessors
+        // expansões úteis; vamos tratar com fallback mesmo sem expand
         .addExpand("latest_invoice")
-        .addExpand("latest_invoice.payment_intent")
         .addExpand("pending_setup_intent");
 
     if (isBoleto) {
-      // Boleto: fatura enviada para pagamento; não salva PM por padrão
+      // Boleto por fatura
       sb.setCollectionMethod(SubscriptionCreateParams.CollectionMethod.SEND_INVOICE)
-        .setDaysUntilDue(3L)
+        .setDaysUntilDue(3L) // prazo do boleto/fatura
+        // restringe tipos a boleto e ajusta opção de expiração
         .putExtraParam("payment_settings[payment_method_types][]", "boleto")
         .putExtraParam("payment_settings[payment_method_options][boleto][expires_after_days]", 3);
-      // Geralmente não há trial com boleto (não salva PM)
-      // sb.setTrialPeriodDays(30L);
+      // Se quiser trial com boleto, sb.setTrialPeriodDays(30L);
     } else {
-      // Auto-cobrança (cartão/Apple Pay/Google Pay/Link)
+      // Cobrança automática (cartão/Apple Pay/Google Pay/Link) com trial e salvamento do PM
       sb.setCollectionMethod(SubscriptionCreateParams.CollectionMethod.CHARGE_AUTOMATICALLY)
         .setPaymentSettings(
             SubscriptionCreateParams.PaymentSettings.builder()
@@ -94,91 +97,74 @@ public class BillingService {
                 )
                 .build()
         )
-        // Não fixe payment_method_types quando usar AMM (evita conflito com SetupIntent)
-        .putExtraParam("payment_settings[automatic_payment_methods][enabled]", true)
-        // Trial de 30 dias: sem cobrança agora; coletaremos PM via SetupIntent
+        // trial de 30 dias sem cobrança agora; Stripe cria pending_setup_intent
         .setTrialPeriodDays(30L);
     }
 
-    // Idempotência por usuário/price/pmMode evita duplicar assinatura
-    RequestOptions ro = RequestOptions.builder()
+    // Idempotência por usuário/price/mode e override da API VERSION no servidor
+    RequestOptions subRO = RequestOptions.builder()
         .setIdempotencyKey("sub-" + userId + "-" + priceId + "-" + pmMode)
+        .setStripeVersion(serverApiVersion) // <- CORREÇÃO: garante suporte a payment_settings/automatic_payment_methods
         .build();
 
-    final Subscription subscription = Subscription.create(sb.build(), ro);
+    final Subscription subscription = Subscription.create(sb.build(), subRO);
     final String subscriptionId = subscription.getId();
 
-    // 3) Obter dados p/ front (compatível com várias versões do SDK)
-    String paymentIntentClientSecret = null; // só seria usado em cobrança imediata
-    String setupIntentClientSecret = null;   // usado em trial/auto para salvar PM
-    String hostedInvoiceUrl = null;          // boleto/send_invoice
+    // 3) Obter secrets p/ front (stripe-java 29.x)
+    String paymentIntentClientSecret = null;
+    String setupIntentClientSecret  = null;
 
-    // (A) Recupera a fatura mais recente (via objeto expandido ou via ID)
+    // --- latest invoice (expandida ou não) ---
     Invoice inv = null;
-    try { inv = subscription.getLatestInvoiceObject(); } catch (Throwable ignored) {}
+    try { inv = subscription.getLatestInvoiceObject(); } catch (Throwable ignored) { }
     if (inv == null) {
-      try {
-        String invId = subscription.getLatestInvoice();
-        if (StringUtils.hasText(invId)) {
-          inv = Invoice.retrieve(invId);
-        }
-      } catch (Throwable ignored) {}
+      String invId = null;
+      try { invId = subscription.getLatestInvoice(); } catch (Throwable ignored) { }
+      if (StringUtils.hasText(invId)) {
+        inv = Invoice.retrieve(invId);
+      }
     }
-    // Hosted invoice URL (para boleto / send_invoice)
+
+    // v29: confirmation_secret contém o client_secret para confirmar pagamento no front
     if (inv != null) {
-      try { hostedInvoiceUrl = inv.getHostedInvoiceUrl(); } catch (Throwable ignored) {}
-      // Nota: evitamos acessar payment_intent por método inexistente na sua lib.
-      // Para boleto/hosted invoice não é necessário PI client secret.
+      Invoice.ConfirmationSecret cs = null;
+      try { cs = inv.getConfirmationSecret(); } catch (Throwable ignored) {}
+      if (cs != null && StringUtils.hasText(cs.getClientSecret())) {
+        paymentIntentClientSecret = cs.getClientSecret();
+      }
     }
 
-    // (B) Trial/auto: pending_setup_intent (via objeto expandido ou via ID)
-    SetupIntent pendingSi = null;
-    try { pendingSi = subscription.getPendingSetupIntentObject(); } catch (Throwable ignored) {}
-    if (pendingSi == null) {
-      try {
-        String siId = subscription.getPendingSetupIntent();
-        if (StringUtils.hasText(siId)) {
-          pendingSi = SetupIntent.retrieve(siId);
-        }
-      } catch (Throwable ignored) {}
-    }
-    if (pendingSi != null) {
-      try { setupIntentClientSecret = pendingSi.getClientSecret(); } catch (Throwable ignored) {}
-    }
-
-    // (C) Fallback: se era para ter trial e NÃO veio SI, cria manualmente
-    boolean hasTrial = false;
-    try { hasTrial = subscription.getTrialEnd() != null; } catch (Throwable ignored) {}
-    if (!isBoleto && hasTrial && setupIntentClientSecret == null) {
-      SetupIntent si = SetupIntent.create(
-          SetupIntentCreateParams.builder()
-              .setCustomer(customerId)
-              .setUsage(SetupIntentCreateParams.Usage.OFF_SESSION)
-              .build()
-      );
-      setupIntentClientSecret = si.getClientSecret();
+    // --- pending_setup_intent (expandido ou não) ---
+    SetupIntent pendingSiObj = null;
+    try { pendingSiObj = subscription.getPendingSetupIntentObject(); } catch (Throwable ignored) { }
+    if (pendingSiObj != null) {
+      setupIntentClientSecret = pendingSiObj.getClientSecret();
+    } else {
+      String pendingSiId = null;
+      try { pendingSiId = subscription.getPendingSetupIntent(); } catch (Throwable ignored) { }
+      if (StringUtils.hasText(pendingSiId)) {
+        SetupIntent si = SetupIntent.retrieve(pendingSiId);
+        setupIntentClientSecret = si.getClientSecret();
+      }
     }
 
-    // 4) Ephemeral Key (para mobile) – sempre com a versão do app
+    // 4) Ephemeral Key (para mobile) – versão definida nos params (não via RequestOptions)
     final EphemeralKeyCreateParams ekParams = EphemeralKeyCreateParams.builder()
         .setCustomer(customerId)
-        .setStripeVersion(stripeVersion)
+        .setStripeVersion(stripeVersionMobile) // versão da API para o SDK do app
         .build();
     final EphemeralKey ek = EphemeralKey.create(ekParams);
 
-    log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}, hasPendingSI={}, hostedUrl?={}",
-        subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null,
-        hostedInvoiceUrl != null);
+    log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}, hasPendingSI={}",
+        subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null);
 
-    // paymentIntentClientSecret fica null na estratégia atual (trial para auto; boleto via hosted link)
     return new SubscribeResponse(
         stripePublishableKey,
         customerId,
         subscriptionId,
-        paymentIntentClientSecret, // normalmente null no fluxo atual
-        ek.getSecret(),
-        setupIntentClientSecret,
-        hostedInvoiceUrl
+        paymentIntentClientSecret, // para confirmar pagamento imediato (se existir)
+        ek.getSecret(),            // ephemeral key para SDK mobile
+        setupIntentClientSecret    // para salvar PM durante o trial (auto)
     );
   }
 
@@ -187,7 +173,7 @@ public class BillingService {
     final Subscription sub = Subscription.retrieve(subscriptionId);
     final SubscriptionBackendStatus status = mapStatus(sub);
 
-    String currentPeriodEndIso = null;
+    String currentPeriodEndIso = null; // manter null se não disponível
     boolean cancelAtPeriodEnd = false;
     try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); }
     catch (Throwable ignored) {}
