@@ -8,7 +8,6 @@ import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
 import com.stripe.model.EphemeralKey;
 import com.stripe.model.Invoice;
-import com.stripe.model.PaymentIntent;
 import com.stripe.model.SetupIntent;
 import com.stripe.model.Subscription;
 import com.stripe.net.RequestOptions;
@@ -83,8 +82,7 @@ public class BillingService {
         // restringe tipos a boleto e ajusta opção de expiração
         .putExtraParam("payment_settings[payment_method_types][]", "boleto")
         .putExtraParam("payment_settings[payment_method_options][boleto][expires_after_days]", 3);
-      // Geralmente sem trial com boleto; se quiser trial, descomente:
-      // sb.setTrialPeriodDays(30L);
+      // Se quiser trial com boleto, setTrialPeriodDays(30L)
     } else {
       // Cobrança automática (cartão/Apple Pay/Google Pay/Link) com trial e salvamento do PM
       sb.setCollectionMethod(SubscriptionCreateParams.CollectionMethod.CHARGE_AUTOMATICALLY)
@@ -97,7 +95,7 @@ public class BillingService {
         )
         // trial de 30 dias sem cobrança agora; Stripe cria pending_setup_intent
         .setTrialPeriodDays(30L);
-      // Observação: não fixamos payment_method_types; deixamos o Stripe determinar (evita erros)
+      // Não fixar payment_method_types evita erros e deixa o Stripe decidir
     }
 
     // Idempotência por usuário/price/mode evita duplicar assinatura
@@ -108,7 +106,7 @@ public class BillingService {
     final Subscription subscription = Subscription.create(sb.build(), subRO);
     final String subscriptionId = subscription.getId();
 
-    // 3) Obter secrets p/ front (compatível com stripe-java 29.x)
+    // 3) Obter secrets p/ front (stripe-java 29.x)
     String paymentIntentClientSecret = null;
     String setupIntentClientSecret  = null;
 
@@ -123,20 +121,18 @@ public class BillingService {
       }
     }
 
+    // v29: confirmation_secret contém o client_secret para confirmar pagamento no front
     if (inv != null) {
-      // Em 29.x, Invoice#getPaymentIntent() retorna o ID; recupere para obter o client_secret
-      String piId = null;
-      try { piId = inv.getPaymentIntent(); } catch (Throwable ignored) { }
-      if (StringUtils.hasText(piId)) {
-        PaymentIntent pi = PaymentIntent.retrieve(piId);
-        paymentIntentClientSecret = pi.getClientSecret();
+      Invoice.ConfirmationSecret cs = null;
+      try { cs = inv.getConfirmationSecret(); } catch (Throwable ignored) {}
+      if (cs != null && StringUtils.hasText(cs.getClientSecret())) {
+        paymentIntentClientSecret = cs.getClientSecret();
       }
     }
 
     // --- pending_setup_intent (expandido ou não) ---
     SetupIntent pendingSiObj = null;
     try { pendingSiObj = subscription.getPendingSetupIntentObject(); } catch (Throwable ignored) { }
-
     if (pendingSiObj != null) {
       setupIntentClientSecret = pendingSiObj.getClientSecret();
     } else {
@@ -148,14 +144,12 @@ public class BillingService {
       }
     }
 
-    // 4) Ephemeral Key (para mobile) – via header de versão
+    // 4) Ephemeral Key (para mobile) – versão definida nos params (não via RequestOptions)
     final EphemeralKeyCreateParams ekParams = EphemeralKeyCreateParams.builder()
         .setCustomer(customerId)
+        .setStripeVersion(stripeVersion) // v29: define a versão da API aqui
         .build();
-    final RequestOptions ekRO = RequestOptions.builder()
-        .setStripeVersionOverride(stripeVersion) // versão da API usada no app
-        .build();
-    final EphemeralKey ek = EphemeralKey.create(ekParams, ekRO);
+    final EphemeralKey ek = EphemeralKey.create(ekParams);
 
     log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}, hasPendingSI={}",
         subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null);
@@ -214,7 +208,6 @@ public class BillingService {
     } catch (Exception e) {
       log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
-    
   }
 
   // ---------------- helpers ----------------
