@@ -214,6 +214,7 @@ public class BillingService {
     } catch (Exception e) {
       log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
+    
   }
 
   // ---------------- helpers ----------------
