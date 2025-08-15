@@ -169,7 +169,7 @@ public class BillingService {
         subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null,
         hostedInvoiceUrl != null);
 
-    // ⚠️ Construtor com 7 argumentos (inclui hostedInvoiceUrl)
+    // Construtor com 7 argumentos (inclui hostedInvoiceUrl)
     return new SubscribeResponse(
         stripePublishableKey,
         customerId,
