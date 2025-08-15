@@ -8,10 +8,11 @@ import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
 import com.stripe.model.EphemeralKey;
 import com.stripe.model.Invoice;
-import com.stripe.model.PaymentIntent;
+import com.stripe.model.SetupIntent;
 import com.stripe.model.Subscription;
 import com.stripe.net.RequestOptions;
 import com.stripe.param.EphemeralKeyCreateParams;
+import com.stripe.param.SetupIntentCreateParams;
 import com.stripe.param.SubscriptionCreateParams;
 import com.stripe.param.SubscriptionUpdateParams;
 import org.slf4j.Logger;
@@ -20,14 +21,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
-
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
 
 @Service
 public class BillingService {
@@ -43,6 +36,7 @@ public class BillingService {
   @Value("${app.stripe.prices.basic}")
   private String defaultBasicPriceId;
 
+  /** Versão da API usada pelo SDK mobile (RN/Android/iOS) */
   @Value("${app.stripe.mobile-api-version:2020-08-27}")
   private String mobileApiVersionDefault;
 
@@ -68,75 +62,56 @@ public class BillingService {
     // 1) Customer único por userId
     final String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
 
-    // 2) Subscription DEFAULT_INCOMPLETE + salvar PM + expand (opcional)
-    SubscriptionCreateParams.Builder sb = SubscriptionCreateParams.builder()
+    // 2) Subscription com trial de 30 dias (sem cobrança agora)
+    SubscriptionCreateParams subParams = SubscriptionCreateParams.builder()
         .setCustomer(customerId)
         .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
-        .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
+        .setTrialPeriodDays(30L) // <- trial de 30 dias
+        // Cobrança automática quando emitir a fatura, ao fim do trial
         .setPaymentSettings(
             SubscriptionCreateParams.PaymentSettings.builder()
+                // Vai salvar após a 1ª cobrança; antes disso vamos coletar com SetupIntent
                 .setSaveDefaultPaymentMethod(
                     SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION
-                ).build()
+                )
+                .build()
         )
-        .addExpand("latest_invoice.payment_intent"); // manter é ok, mas não dependemos disso
+        .build();
 
+    // Idempotência por usuário/price evita duplicar assinatura em toques rápidos
     RequestOptions ro = RequestOptions.builder()
         .setIdempotencyKey("sub-" + userId + "-" + priceId)
         .build();
 
-    final Subscription subscription = Subscription.create(sb.build(), ro);
+    final Subscription subscription = Subscription.create(subParams, ro);
     final String subscriptionId = subscription.getId();
 
-    // 3) COMPATÍVEL COM QUALQUER VERSÃO DO stripe-java:
-//    Busca o invoice por ID expandindo payment_intent e lê o client_secret do JSON cru.
-    String paymentIntentClientSecret = null;
-    try {
-      String latestInvoiceId = subscription.getLatestInvoice(); // ID do invoice
-      if (StringUtils.hasText(latestInvoiceId)) {
-        Map<String, Object> invParams = new HashMap<>();
-        invParams.put("expand", Arrays.asList("payment_intent"));
+    // 3) Criar SetupIntent para coletar cartão (uso OFF_SESSION para futuras cobranças automáticas)
+    SetupIntentCreateParams siParams = SetupIntentCreateParams.builder()
+        .setCustomer(customerId)
+        .setUsage(SetupIntentCreateParams.Usage.OFF_SESSION)
+        .build();
+    final SetupIntent setupIntent = SetupIntent.create(siParams);
+    final String setupIntentClientSecret = setupIntent.getClientSecret();
 
-        Invoice invoice = Invoice.retrieve(latestInvoiceId, invParams, null);
-
-        // Lê o JSON cru da resposta
-        if (invoice.getLastResponse() != null && invoice.getLastResponse().body() != null) {
-          String body = invoice.getLastResponse().body();
-          JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-          JsonElement piEl = root.get("payment_intent");
-
-          if (piEl != null && piEl.isJsonObject()) {
-            JsonObject piObj = piEl.getAsJsonObject();
-            JsonElement cs = piObj.get("client_secret");
-            if (cs != null && !cs.isJsonNull()) {
-              paymentIntentClientSecret = cs.getAsString();
-            }
-          } else if (piEl != null && piEl.isJsonPrimitive()) {
-            // Algumas versões retornam apenas o ID do PI; recupera e pega o client_secret
-            String piId = piEl.getAsString();
-            PaymentIntent pi = PaymentIntent.retrieve(piId);
-            paymentIntentClientSecret = pi.getClientSecret();
-          }
-        }
-      }
-    } catch (Exception e) {
-      log.warn("[BILL] Falha ao obter client_secret do PaymentIntent: {}", e.getMessage());
-    }
-
-
-    // 4) Ephemeral Key (sempre com versão da API do app)
+    // 4) Ephemeral Key (sempre com a versão da API usada no app)
     final EphemeralKeyCreateParams ekParams = EphemeralKeyCreateParams.builder()
         .setCustomer(customerId)
         .setStripeVersion(stripeVersion)
         .build();
     final EphemeralKey ek = EphemeralKey.create(ekParams);
 
+    log.info("[BILL][FLOW][RES] subscriptionId={}, customerId={}, trialDays=30, hasSetupIntent={}",
+        subscriptionId, customerId, (setupIntentClientSecret != null));
+
+    // paymentIntentClientSecret permanece null (não há cobrança agora)
     return new SubscribeResponse(
         stripePublishableKey,
         customerId,
         subscriptionId,
-        paymentIntentClientSecret,
-        ek.getSecret()
+        null,                  // paymentIntentClientSecret
+        ek.getSecret(),
+        setupIntentClientSecret // <- novo campo para o app confirmar o cartão
     );
   }
 
@@ -145,7 +120,7 @@ public class BillingService {
     final Subscription sub = Subscription.retrieve(subscriptionId);
     final SubscriptionBackendStatus status = mapStatus(sub);
 
-    // Algumas versões do SDK não expõem current_period_end — mantenha null
+    // Algumas versões não expõem current_period_end → mantemos null
     String currentPeriodEndIso = null;
 
     boolean cancelAtPeriodEnd = false;
@@ -182,7 +157,7 @@ public class BillingService {
       final String invId = (inv != null) ? inv.getId() : null;
       final SubscriptionBackendStatus status = (sub != null) ? mapStatus(sub) : SubscriptionBackendStatus.INACTIVE;
       log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
-      // TODO: persistir em DB (status + datas), e publicar evento se necessário
+      // TODO: persistir em DB (status + datas), e publicar evento/eventos internos
     } catch (Exception e) {
       log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }

@@ -32,12 +32,12 @@ public class StripeWebhookController {
 
   private final BillingService billingService;
 
-@Value("${app.stripe.webhook-secret:${app.stripe.webhook.secret:}}")
-private String webhookSecret;
+  @Value("${app.stripe.webhook-secret:${app.stripe.webhook.secret:}}")
+  private String webhookSecret;
 
-// (opcional) também com default para não quebrar se faltar
-@Value("${app.stripe.secret-key:}")
-private String stripeSecretKey;
+  // (opcional) também com default para não quebrar se faltar
+  @Value("${app.stripe.secret-key:}")
+  private String stripeSecretKey;
 
   public StripeWebhookController(BillingService billingService) {
     this.billingService = billingService;
