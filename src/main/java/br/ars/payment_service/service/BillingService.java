@@ -6,7 +6,11 @@ import br.ars.payment_service.dto.SubscriptionBackendStatus;
 import br.ars.payment_service.dto.SubscriptionStatusResponse;
 import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
-import com.stripe.model.*;
+import com.stripe.model.EphemeralKey;
+import com.stripe.model.Invoice;
+import com.stripe.model.PaymentIntent;
+import com.stripe.model.SetupIntent;
+import com.stripe.model.Subscription;
 import com.stripe.net.RequestOptions;
 import com.stripe.param.EphemeralKeyCreateParams;
 import com.stripe.param.SetupIntentCreateParams;
@@ -67,17 +71,18 @@ public class BillingService {
         .setCustomer(customerId)
         .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
         .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
-        // Expand para receber PI (quando houver cobrança agora) e/ou pending_setup_intent (para trial)
+        // Expansões para SDKs que suportam object accessors
+        .addExpand("latest_invoice")
         .addExpand("latest_invoice.payment_intent")
         .addExpand("pending_setup_intent");
 
     if (isBoleto) {
-      // Boleto: fatura enviada para pagamento; não há PM salvo para futuras cobranças
+      // Boleto: fatura enviada para pagamento; não salva PM por padrão
       sb.setCollectionMethod(SubscriptionCreateParams.CollectionMethod.SEND_INVOICE)
         .setDaysUntilDue(3L)
         .putExtraParam("payment_settings[payment_method_types][]", "boleto")
         .putExtraParam("payment_settings[payment_method_options][boleto][expires_after_days]", 3);
-      // (opcional) trial não é comum com boleto porque não salva PM.
+      // Geralmente não há trial com boleto (não salva PM)
       // sb.setTrialPeriodDays(30L);
     } else {
       // Auto-cobrança (cartão/Apple Pay/Google Pay/Link)
@@ -89,13 +94,13 @@ public class BillingService {
                 )
                 .build()
         )
-        // NÃO fixe payment_method_types quando for usar AMM (evita conflitos com SetupIntent)
+        // Não fixe payment_method_types quando usar AMM (evita conflito com SetupIntent)
         .putExtraParam("payment_settings[automatic_payment_methods][enabled]", true)
-        // trial sem cobrança agora; criaremos/setup intent para salvar o método
+        // Trial de 30 dias: sem cobrança agora; coletaremos PM via SetupIntent
         .setTrialPeriodDays(30L);
     }
 
-    // Idempotência por usuário/price evita duplicar assinatura
+    // Idempotência por usuário/price/pmMode evita duplicar assinatura
     RequestOptions ro = RequestOptions.builder()
         .setIdempotencyKey("sub-" + userId + "-" + priceId + "-" + pmMode)
         .build();
@@ -103,42 +108,47 @@ public class BillingService {
     final Subscription subscription = Subscription.create(sb.build(), ro);
     final String subscriptionId = subscription.getId();
 
-    // 3) Obter secrets p/ front (conforme o caso)
-    String paymentIntentClientSecret = null;
-    String setupIntentClientSecret = null;
-    String hostedInvoiceUrl = null;
+    // 3) Obter dados p/ front (compatível com várias versões do SDK)
+    String paymentIntentClientSecret = null; // só seria usado em cobrança imediata
+    String setupIntentClientSecret = null;   // usado em trial/auto para salvar PM
+    String hostedInvoiceUrl = null;          // boleto/send_invoice
 
-    // (A) Se houver fatura: tentar pegar o PaymentIntent (cobrança imediata) + hosted invoice url
-    final Invoice inv = subscription.getLatestInvoiceObject();
+    // (A) Recupera a fatura mais recente (via objeto expandido ou via ID)
+    Invoice inv = null;
+    try { inv = subscription.getLatestInvoiceObject(); } catch (Throwable ignored) {}
+    if (inv == null) {
+      try {
+        String invId = subscription.getLatestInvoice();
+        if (StringUtils.hasText(invId)) {
+          inv = Invoice.retrieve(invId);
+        }
+      } catch (Throwable ignored) {}
+    }
+    // Hosted invoice URL (para boleto / send_invoice)
     if (inv != null) {
       try { hostedInvoiceUrl = inv.getHostedInvoiceUrl(); } catch (Throwable ignored) {}
-
-      // Tenta pelo objeto (SDKs mais novos)…
-      try {
-        PaymentIntent piObj = inv.getPaymentIntentObject();
-        if (piObj != null) paymentIntentClientSecret = piObj.getClientSecret();
-      } catch (Throwable ignoreOldSdk) {
-        // …ou pelo ID (SDKs antigos)
-        try {
-          String piId = null;
-          try { piId = inv.getPaymentIntent(); } catch (Throwable ignored) {}
-          if (piId != null) {
-            PaymentIntent pi = PaymentIntent.retrieve(piId);
-            if (pi != null) paymentIntentClientSecret = pi.getClientSecret();
-          }
-        } catch (Throwable ignored) {}
-      }
+      // Nota: evitamos acessar payment_intent por método inexistente na sua lib.
+      // Para boleto/hosted invoice não é necessário PI client secret.
     }
 
-    // (B) Trial/auto: tentar o pending_setup_intent
-    try {
-      SetupIntent pendingSi = subscription.getPendingSetupIntentObject();
-      if (pendingSi != null) setupIntentClientSecret = pendingSi.getClientSecret();
-    } catch (Throwable ignored) {}
+    // (B) Trial/auto: pending_setup_intent (via objeto expandido ou via ID)
+    SetupIntent pendingSi = null;
+    try { pendingSi = subscription.getPendingSetupIntentObject(); } catch (Throwable ignored) {}
+    if (pendingSi == null) {
+      try {
+        String siId = subscription.getPendingSetupIntent();
+        if (StringUtils.hasText(siId)) {
+          pendingSi = SetupIntent.retrieve(siId);
+        }
+      } catch (Throwable ignored) {}
+    }
+    if (pendingSi != null) {
+      try { setupIntentClientSecret = pendingSi.getClientSecret(); } catch (Throwable ignored) {}
+    }
 
     // (C) Fallback: se era para ter trial e NÃO veio SI, cria manualmente
-    boolean hasTrial;
-    try { hasTrial = subscription.getTrialEnd() != null; } catch (Throwable t) { hasTrial = false; }
+    boolean hasTrial = false;
+    try { hasTrial = subscription.getTrialEnd() != null; } catch (Throwable ignored) {}
     if (!isBoleto && hasTrial && setupIntentClientSecret == null) {
       SetupIntent si = SetupIntent.create(
           SetupIntentCreateParams.builder()
@@ -149,7 +159,7 @@ public class BillingService {
       setupIntentClientSecret = si.getClientSecret();
     }
 
-    // 4) Ephemeral Key (para mobile) – use sempre a versão do app
+    // 4) Ephemeral Key (para mobile) – sempre com a versão do app
     final EphemeralKeyCreateParams ekParams = EphemeralKeyCreateParams.builder()
         .setCustomer(customerId)
         .setStripeVersion(stripeVersion)
@@ -160,11 +170,12 @@ public class BillingService {
         subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null,
         hostedInvoiceUrl != null);
 
+    // paymentIntentClientSecret fica null na estratégia atual (trial para auto; boleto via hosted link)
     return new SubscribeResponse(
         stripePublishableKey,
         customerId,
         subscriptionId,
-        paymentIntentClientSecret,
+        paymentIntentClientSecret, // normalmente null no fluxo atual
         ek.getSecret(),
         setupIntentClientSecret,
         hostedInvoiceUrl
@@ -211,7 +222,7 @@ public class BillingService {
       final String invId = (inv != null) ? inv.getId() : null;
       final SubscriptionBackendStatus status = (sub != null) ? mapStatus(sub) : SubscriptionBackendStatus.INACTIVE;
       log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
-      // TODO: persistir em DB (status + datas), e publicar evento/eventos internos
+      // TODO: persistir em DB (status + datas), e publicar eventos internos
     } catch (Exception e) {
       log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
