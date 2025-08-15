@@ -6,8 +6,10 @@ import br.ars.payment_service.dto.SubscriptionBackendStatus;
 import br.ars.payment_service.dto.SubscriptionStatusResponse;
 import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
-import com.stripe.model.*;
-import com.stripe.net.RequestOptions;
+import com.stripe.model.EphemeralKey;
+import com.stripe.model.Invoice;
+import com.stripe.model.PaymentIntent;
+import com.stripe.model.Subscription;
 import com.stripe.param.EphemeralKeyCreateParams;
 import com.stripe.param.SubscriptionCreateParams;
 import com.stripe.param.SubscriptionUpdateParams;
@@ -17,6 +19,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
+
+import java.lang.reflect.Method;
 
 @Service
 public class BillingService {
@@ -32,7 +36,7 @@ public class BillingService {
   @Value("${app.stripe.prices.basic}")
   private String defaultBasicPriceId;
 
-  /** Versão da API usada pelo app móvel ao criar EphemeralKey (header Stripe-Version) */
+  /** Versão da API que o app móvel usa */
   @Value("${app.stripe.mobile-api-version:2020-08-27}")
   private String mobileApiVersionDefault;
 
@@ -42,13 +46,7 @@ public class BillingService {
     this.billingCustomerService = billingCustomerService;
   }
 
-  /**
-   * Fluxo único: Google Pay (CHARGE_AUTOMATICALLY) — criamos a assinatura em
-   * DEFAULT_INCOMPLETE e retornamos o client_secret do PaymentIntent da
-   * latest_invoice para o app confirmar via Google Pay.
-   *
-   * >>> NÃO enviamos payment_settings[automatic_payment_methods] <<<
-   */
+  /** Fluxo único: Google Pay (PaymentSheet com PaymentIntent) */
   @Transactional
   public SubscribeResponse startSubscription(SubscribeRequest req) throws StripeException {
     Stripe.apiKey = stripeSecretKey;
@@ -58,88 +56,80 @@ public class BillingService {
     final String priceId = StringUtils.hasText(req.priceId()) ? req.priceId() : defaultBasicPriceId;
     final String stripeVersion = StringUtils.hasText(req.stripeVersion()) ? req.stripeVersion() : mobileApiVersionDefault;
 
-    log.info("[BILL][FLOW] startSubscription (GPay only) userId={}, email={}, priceId={}, stripeVersion={}",
+    log.info("[BILL][FLOW] startSubscription (GooglePay) userId={}, email={}, priceId={}, stripeVersion={}",
         userId, email, priceId, stripeVersion);
 
-    // 1) Customer único por userId
+    // 1) Customer
     final String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
 
-    // 2) Assinatura: cobrança automática + default_incomplete + expand PI da latest_invoice
-    SubscriptionCreateParams.Builder sb = SubscriptionCreateParams.builder()
+    // 2) Assinatura default_incomplete para gerar PI na latest_invoice
+    final SubscriptionCreateParams params = SubscriptionCreateParams.builder()
         .setCustomer(customerId)
         .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
         .setCollectionMethod(SubscriptionCreateParams.CollectionMethod.CHARGE_AUTOMATICALLY)
         .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
         .setPaymentSettings(
             SubscriptionCreateParams.PaymentSettings.builder()
-                // salva o PM confirmado via PI como default da assinatura
                 .setSaveDefaultPaymentMethod(
                     SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION
-                )
-                .build()
+                ).build()
         )
         .addExpand("latest_invoice")
-        .addExpand("latest_invoice.payment_intent"); // precisamos do client_secret
+        .addExpand("latest_invoice.payment_intent") // queremos o PI da fatura
+        .build();
 
-    final Subscription subscription = Subscription.create(sb.build());
+    final Subscription subscription = Subscription.create(params);
     final String subscriptionId = subscription.getId();
 
-    // 3) Pegamos o PaymentIntent da latest_invoice
+    // 3) Extrair PaymentIntent da latest_invoice (compatível com SDKs antigos via reflexão)
     String paymentIntentClientSecret = null;
-    String setupIntentClientSecret = null; // não usado no GPay imediato
-    String hostedInvoiceUrl = null;        // não aplicável no GPay
-
     Invoice inv = null;
     try { inv = subscription.getLatestInvoiceObject(); } catch (Throwable ignored) {}
     if (inv == null) {
       try {
-        final String invId = subscription.getLatestInvoice();
+        String invId = subscription.getLatestInvoice();
         if (StringUtils.hasText(invId)) inv = Invoice.retrieve(invId);
       } catch (Throwable ignored) {}
     }
 
     if (inv != null) {
-      // se expandido, pegamos direto o objeto
-      PaymentIntent pi = null;
-      try { pi = inv.getPaymentIntentObject(); } catch (Throwable ignored) {}
-      if (pi != null) {
-        try { paymentIntentClientSecret = pi.getClientSecret(); } catch (Throwable ignored) {}
-      } else {
-        // fallback compatível com libs antigas sem getPaymentIntent():
-        try {
-          java.lang.reflect.Method m = Invoice.class.getMethod("getPaymentIntent");
-          Object idObj = m.invoke(inv);
-          if (idObj instanceof String id && StringUtils.hasText(id)) {
-            PaymentIntent fetched = PaymentIntent.retrieve(id);
-            paymentIntentClientSecret = fetched.getClientSecret();
-          }
-        } catch (Throwable ignored) {}
+      // tentar Invoice#getPaymentIntent() via reflexão
+      try {
+        Method m = Invoice.class.getMethod("getPaymentIntent");
+        Object idObj = m.invoke(inv);
+        if (idObj instanceof String piId && StringUtils.hasText(piId)) {
+          PaymentIntent pi = PaymentIntent.retrieve(piId);
+          paymentIntentClientSecret = pi.getClientSecret();
+        }
+      } catch (Throwable ignored) {
+        // se a versão do SDK expôs outro nome, adicione novos fallbacks aqui se necessário
       }
     }
 
-    // 4) Ephemeral Key para o app — a versão vai no RequestOptions (Stripe-Version header)
-    final EphemeralKeyCreateParams ekParams =
-        EphemeralKeyCreateParams.builder().setCustomer(customerId).build();
+    // 4) Ephemeral Key para o app (define Stripe-Version globalmente durante a criação)
+    final String prevApiVersion = Stripe.apiVersion;
+    try {
+      Stripe.apiVersion = stripeVersion; // aplica somente para esta thread/chamada
+      EphemeralKeyCreateParams ekParams = EphemeralKeyCreateParams.builder()
+          .setCustomer(customerId)
+          .build();
+      EphemeralKey ek = EphemeralKey.create(ekParams);
 
-    final RequestOptions ekOpts =
-        RequestOptions.builder().setStripeVersionOverride(stripeVersion).build();
+      log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}",
+          subscriptionId, customerId, paymentIntentClientSecret != null);
 
-    final EphemeralKey ek = EphemeralKey.create(ekParams, ekOpts);
-
-    log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}, hasSI={}, hostedUrl?={}",
-        subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null,
-        hostedInvoiceUrl != null);
-
-    // DTO com 7 campos: publishableKey, customerId, subscriptionId, piClientSecret, ephKey, siClientSecret, hostedUrl
-    return new SubscribeResponse(
-        stripePublishableKey,
-        customerId,
-        subscriptionId,
-        paymentIntentClientSecret,
-        ek.getSecret(),
-        setupIntentClientSecret,
-        hostedInvoiceUrl
-    );
+      return new SubscribeResponse(
+          stripePublishableKey,
+          customerId,
+          subscriptionId,
+          paymentIntentClientSecret, // precisa estar preenchido para o PaymentSheet (GPay) pagar a fatura
+          ek.getSecret(),
+          null,        // setupIntentClientSecret (não usado no GPay imediato)
+          null         // hostedInvoiceUrl (não aplicável)
+      );
+    } finally {
+      Stripe.apiVersion = prevApiVersion; // restaura
+    }
   }
 
   public SubscriptionStatusResponse getStatus(String subscriptionId) throws StripeException {
@@ -149,8 +139,7 @@ public class BillingService {
 
     String currentPeriodEndIso = null;
     boolean cancelAtPeriodEnd = false;
-    try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); }
-    catch (Throwable ignored) {}
+    try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); } catch (Throwable ignored) {}
 
     return new SubscriptionStatusResponse(subscriptionId, status, currentPeriodEndIso, cancelAtPeriodEnd);
   }
@@ -174,18 +163,6 @@ public class BillingService {
 
     final Subscription updated = sub.update(b.build());
     log.info("[BILL][CHANGE_PLAN] subscriptionId={}, status={}", updated.getId(), updated.getStatus());
-  }
-
-  public void applyWebhookUpdate(Subscription sub, Invoice inv) {
-    try {
-      final String subIdSafe = (sub != null) ? sub.getId() : null;
-      final String invId = (inv != null) ? inv.getId() : null;
-      final SubscriptionBackendStatus status = (sub != null) ? mapStatus(sub) : SubscriptionBackendStatus.INACTIVE;
-      log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
-      // TODO: persistir status/datas em DB e publicar eventos internos
-    } catch (Exception e) {
-      log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
-    }
   }
 
   // ---------------- helpers ----------------
