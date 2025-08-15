@@ -6,12 +6,10 @@ import br.ars.payment_service.dto.SubscriptionBackendStatus;
 import br.ars.payment_service.dto.SubscriptionStatusResponse;
 import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
-import com.stripe.model.EphemeralKey;
-import com.stripe.model.Invoice;
-import com.stripe.model.SetupIntent;
-import com.stripe.model.Subscription;
+import com.stripe.model.*;
 import com.stripe.net.RequestOptions;
 import com.stripe.param.EphemeralKeyCreateParams;
+import com.stripe.param.SetupIntentCreateParams;
 import com.stripe.param.SubscriptionCreateParams;
 import com.stripe.param.SubscriptionUpdateParams;
 import org.slf4j.Logger;
@@ -52,8 +50,7 @@ public class BillingService {
     final String userId = require(req.userId(), "userId");
     final String email = req.email();
     final String priceId = StringUtils.hasText(req.priceId()) ? req.priceId() : defaultBasicPriceId;
-    final String stripeVersion = StringUtils.hasText(req.stripeVersion())
-        ? req.stripeVersion() : mobileApiVersionDefault;
+    final String stripeVersion = StringUtils.hasText(req.stripeVersion()) ? req.stripeVersion() : mobileApiVersionDefault;
 
     // "auto" (cartões/carteiras/link) ou "boleto"
     final String pmMode = StringUtils.hasText(req.pmMode()) ? req.pmMode() : "auto";
@@ -65,26 +62,25 @@ public class BillingService {
     // 1) Customer único por userId
     final String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
 
-    // 2) Monta Subscription Create Params de acordo com o método de pagamento
+    // 2) Monta Subscription Create Params de acordo com o PM
     SubscriptionCreateParams.Builder sb = SubscriptionCreateParams.builder()
         .setCustomer(customerId)
         .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
-        // cria como incomplete para permitir confirmação no front
         .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
-        // expansões úteis; vamos tratar com fallback mesmo sem expand
-        .addExpand("latest_invoice")
+        // Expand para receber PI (quando houver cobrança agora) e/ou pending_setup_intent (para trial)
+        .addExpand("latest_invoice.payment_intent")
         .addExpand("pending_setup_intent");
 
     if (isBoleto) {
-      // Boleto por fatura (não salva PM para futuras cobranças automaticamente)
+      // Boleto: fatura enviada para pagamento; não há PM salvo para futuras cobranças
       sb.setCollectionMethod(SubscriptionCreateParams.CollectionMethod.SEND_INVOICE)
-        .setDaysUntilDue(3L) // prazo do boleto/fatura
-        // restringe tipos a boleto e ajusta opção de expiração
+        .setDaysUntilDue(3L)
         .putExtraParam("payment_settings[payment_method_types][]", "boleto")
         .putExtraParam("payment_settings[payment_method_options][boleto][expires_after_days]", 3);
-      // Se quiser trial com boleto, setTrialPeriodDays(30L)
+      // (opcional) trial não é comum com boleto porque não salva PM.
+      // sb.setTrialPeriodDays(30L);
     } else {
-      // Cobrança automática (cartão/Apple Pay/Google Pay/Link) com trial e salvamento do PM
+      // Auto-cobrança (cartão/Apple Pay/Google Pay/Link)
       sb.setCollectionMethod(SubscriptionCreateParams.CollectionMethod.CHARGE_AUTOMATICALLY)
         .setPaymentSettings(
             SubscriptionCreateParams.PaymentSettings.builder()
@@ -93,74 +89,85 @@ public class BillingService {
                 )
                 .build()
         )
-        // trial de 30 dias sem cobrança agora; Stripe cria pending_setup_intent
+        // NÃO fixe payment_method_types quando for usar AMM (evita conflitos com SetupIntent)
+        .putExtraParam("payment_settings[automatic_payment_methods][enabled]", true)
+        // trial sem cobrança agora; criaremos/setup intent para salvar o método
         .setTrialPeriodDays(30L);
-      // Não fixar payment_method_types evita erros e deixa o Stripe decidir
     }
 
-    // Idempotência por usuário/price/mode evita duplicar assinatura
-    RequestOptions subRO = RequestOptions.builder()
+    // Idempotência por usuário/price evita duplicar assinatura
+    RequestOptions ro = RequestOptions.builder()
         .setIdempotencyKey("sub-" + userId + "-" + priceId + "-" + pmMode)
         .build();
 
-    final Subscription subscription = Subscription.create(sb.build(), subRO);
+    final Subscription subscription = Subscription.create(sb.build(), ro);
     final String subscriptionId = subscription.getId();
 
-    // 3) Obter secrets p/ front (stripe-java 29.x)
+    // 3) Obter secrets p/ front (conforme o caso)
     String paymentIntentClientSecret = null;
-    String setupIntentClientSecret  = null;
+    String setupIntentClientSecret = null;
+    String hostedInvoiceUrl = null;
 
-    // --- latest invoice (expandida ou não) ---
-    Invoice inv = null;
-    try { inv = subscription.getLatestInvoiceObject(); } catch (Throwable ignored) { }
-    if (inv == null) {
-      String invId = null;
-      try { invId = subscription.getLatestInvoice(); } catch (Throwable ignored) { }
-      if (StringUtils.hasText(invId)) {
-        inv = Invoice.retrieve(invId);
-      }
-    }
-
-    // v29: confirmation_secret contém o client_secret para confirmar pagamento no front
+    // (A) Se houver fatura: tentar pegar o PaymentIntent (cobrança imediata) + hosted invoice url
+    final Invoice inv = subscription.getLatestInvoiceObject();
     if (inv != null) {
-      Invoice.ConfirmationSecret cs = null;
-      try { cs = inv.getConfirmationSecret(); } catch (Throwable ignored) {}
-      if (cs != null && StringUtils.hasText(cs.getClientSecret())) {
-        paymentIntentClientSecret = cs.getClientSecret();
+      try { hostedInvoiceUrl = inv.getHostedInvoiceUrl(); } catch (Throwable ignored) {}
+
+      // Tenta pelo objeto (SDKs mais novos)…
+      try {
+        PaymentIntent piObj = inv.getPaymentIntentObject();
+        if (piObj != null) paymentIntentClientSecret = piObj.getClientSecret();
+      } catch (Throwable ignoreOldSdk) {
+        // …ou pelo ID (SDKs antigos)
+        try {
+          String piId = null;
+          try { piId = inv.getPaymentIntent(); } catch (Throwable ignored) {}
+          if (piId != null) {
+            PaymentIntent pi = PaymentIntent.retrieve(piId);
+            if (pi != null) paymentIntentClientSecret = pi.getClientSecret();
+          }
+        } catch (Throwable ignored) {}
       }
     }
 
-    // --- pending_setup_intent (expandido ou não) ---
-    SetupIntent pendingSiObj = null;
-    try { pendingSiObj = subscription.getPendingSetupIntentObject(); } catch (Throwable ignored) { }
-    if (pendingSiObj != null) {
-      setupIntentClientSecret = pendingSiObj.getClientSecret();
-    } else {
-      String pendingSiId = null;
-      try { pendingSiId = subscription.getPendingSetupIntent(); } catch (Throwable ignored) { }
-      if (StringUtils.hasText(pendingSiId)) {
-        SetupIntent si = SetupIntent.retrieve(pendingSiId);
-        setupIntentClientSecret = si.getClientSecret();
-      }
+    // (B) Trial/auto: tentar o pending_setup_intent
+    try {
+      SetupIntent pendingSi = subscription.getPendingSetupIntentObject();
+      if (pendingSi != null) setupIntentClientSecret = pendingSi.getClientSecret();
+    } catch (Throwable ignored) {}
+
+    // (C) Fallback: se era para ter trial e NÃO veio SI, cria manualmente
+    boolean hasTrial;
+    try { hasTrial = subscription.getTrialEnd() != null; } catch (Throwable t) { hasTrial = false; }
+    if (!isBoleto && hasTrial && setupIntentClientSecret == null) {
+      SetupIntent si = SetupIntent.create(
+          SetupIntentCreateParams.builder()
+              .setCustomer(customerId)
+              .setUsage(SetupIntentCreateParams.Usage.OFF_SESSION)
+              .build()
+      );
+      setupIntentClientSecret = si.getClientSecret();
     }
 
-    // 4) Ephemeral Key (para mobile) – versão definida nos params (não via RequestOptions)
+    // 4) Ephemeral Key (para mobile) – use sempre a versão do app
     final EphemeralKeyCreateParams ekParams = EphemeralKeyCreateParams.builder()
         .setCustomer(customerId)
-        .setStripeVersion(stripeVersion) // v29: define a versão da API aqui
+        .setStripeVersion(stripeVersion)
         .build();
     final EphemeralKey ek = EphemeralKey.create(ekParams);
 
-    log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}, hasPendingSI={}",
-        subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null);
+    log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}, hasPendingSI={}, hostedUrl?={}",
+        subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null,
+        hostedInvoiceUrl != null);
 
     return new SubscribeResponse(
         stripePublishableKey,
         customerId,
         subscriptionId,
-        paymentIntentClientSecret, // para confirmar pagamento imediato (se existir)
-        ek.getSecret(),            // ephemeral key para SDK mobile
-        setupIntentClientSecret    // para salvar PM durante o trial (auto)
+        paymentIntentClientSecret,
+        ek.getSecret(),
+        setupIntentClientSecret,
+        hostedInvoiceUrl
     );
   }
 
@@ -169,7 +176,7 @@ public class BillingService {
     final Subscription sub = Subscription.retrieve(subscriptionId);
     final SubscriptionBackendStatus status = mapStatus(sub);
 
-    String currentPeriodEndIso = null; // manter null se não disponível
+    String currentPeriodEndIso = null;
     boolean cancelAtPeriodEnd = false;
     try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); }
     catch (Throwable ignored) {}
@@ -204,7 +211,7 @@ public class BillingService {
       final String invId = (inv != null) ? inv.getId() : null;
       final SubscriptionBackendStatus status = (sub != null) ? mapStatus(sub) : SubscriptionBackendStatus.INACTIVE;
       log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
-      // TODO: persistir em DB (status + datas), e publicar eventos internos
+      // TODO: persistir em DB (status + datas), e publicar evento/eventos internos
     } catch (Exception e) {
       log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
