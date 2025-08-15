@@ -12,18 +12,12 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import java.util.Comparator;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Customer único por userId:
- * - Busca por metadata['userId'] antes de criar
- * - Fallback por e-mail (se houver)
- * - Criação com idempotência
- * Obs.: em produção persista o mapeamento userId <-> customerId em DB.
- */
 @Service
 public class BillingCustomerService {
   private static final Logger log = LoggerFactory.getLogger(BillingCustomerService.class);
@@ -77,17 +71,31 @@ public class BillingCustomerService {
   private Customer findCustomerByMetadata(String userId) throws StripeException {
     CustomerSearchParams params = CustomerSearchParams.builder()
         .setQuery("metadata['" + MD_USER_ID + "']:'" + escape(userId) + "'")
+        .setLimit(20L)
         .build();
     CustomerSearchResult res = Customer.search(params);
-    return (res != null && !res.getData().isEmpty()) ? res.getData().get(0) : null;
+    if (res == null || res.getData().isEmpty()) return null;
+
+    // pega o mais recente (ou ajuste seu critério aqui)
+    return res.getData().stream()
+        .max(Comparator.comparing(Customer::getCreated))
+        .orElse(res.getData().get(0));
   }
 
   private Customer findBestCustomerByEmail(String email) throws StripeException {
     CustomerSearchParams params = CustomerSearchParams.builder()
-        .setQuery("email:'" + escape(email) + "' AND -deleted:'true'")
+        // REMOVIDO: "AND -deleted:'true'" (campo não suportado)
+        .setQuery("email:'" + escape(email) + "'")
+        .setLimit(20L)
         .build();
     CustomerSearchResult res = Customer.search(params);
-    return (res != null && !res.getData().isEmpty()) ? res.getData().get(0) : null;
+    if (res == null || res.getData().isEmpty()) return null;
+
+    // prefere quem já tem metadata userId; senão, o mais recente
+    return res.getData().stream()
+        .max(Comparator.<Customer>comparingInt(c -> c.getMetadata() != null && c.getMetadata().containsKey(MD_USER_ID) ? 1 : 0)
+            .thenComparing(Customer::getCreated))
+        .orElse(res.getData().get(0));
   }
 
   private void ensureMetadata(Customer c, String userId) throws StripeException {
@@ -102,7 +110,11 @@ public class BillingCustomerService {
     log.info("[BILL][CUSTOMER] UPDATED metadata userId for customerId={} ({} -> {})", c.getId(), current, userId);
   }
 
-  private static String escape(String s) { return s == null ? "" : s.replace("'", "\\'"); }
+  private static String escape(String s) {
+    if (s == null) return "";
+    // escapa barra invertida e aspas simples para a sintaxe de busca do Stripe
+    return s.replace("\\", "\\\\").replace("'", "\\'");
+  }
 
   public void evictCache(String userId) { cache.remove(userId); }
 }
