@@ -36,7 +36,7 @@ public class BillingService {
   @Value("${app.stripe.prices.basic}")
   private String defaultBasicPriceId;
 
-  /** Versão da API que o app móvel usa */
+  /** Versão da API usada pelo app móvel ao criar EphemeralKey */
   @Value("${app.stripe.mobile-api-version:2020-08-27}")
   private String mobileApiVersionDefault;
 
@@ -75,13 +75,13 @@ public class BillingService {
                 ).build()
         )
         .addExpand("latest_invoice")
-        .addExpand("latest_invoice.payment_intent") // queremos o PI da fatura
+        .addExpand("latest_invoice.payment_intent")
         .build();
 
     final Subscription subscription = Subscription.create(params);
     final String subscriptionId = subscription.getId();
 
-    // 3) Extrair PaymentIntent da latest_invoice (compatível com SDKs antigos via reflexão)
+    // 3) Extrair PaymentIntent da latest_invoice (compatível via reflexão)
     String paymentIntentClientSecret = null;
     Invoice inv = null;
     try { inv = subscription.getLatestInvoiceObject(); } catch (Throwable ignored) {}
@@ -91,45 +91,37 @@ public class BillingService {
         if (StringUtils.hasText(invId)) inv = Invoice.retrieve(invId);
       } catch (Throwable ignored) {}
     }
-
     if (inv != null) {
-      // tentar Invoice#getPaymentIntent() via reflexão
       try {
-        Method m = Invoice.class.getMethod("getPaymentIntent");
+        Method m = Invoice.class.getMethod("getPaymentIntent"); // retorna String id
         Object idObj = m.invoke(inv);
         if (idObj instanceof String piId && StringUtils.hasText(piId)) {
           PaymentIntent pi = PaymentIntent.retrieve(piId);
           paymentIntentClientSecret = pi.getClientSecret();
         }
-      } catch (Throwable ignored) {
-        // se a versão do SDK expôs outro nome, adicione novos fallbacks aqui se necessário
-      }
+      } catch (Throwable ignored) { /* fallback não necessário aqui */ }
     }
 
-    // 4) Ephemeral Key para o app (define Stripe-Version globalmente durante a criação)
-    final String prevApiVersion = Stripe.apiVersion;
-    try {
-      Stripe.apiVersion = stripeVersion; // aplica somente para esta thread/chamada
-      EphemeralKeyCreateParams ekParams = EphemeralKeyCreateParams.builder()
-          .setCustomer(customerId)
-          .build();
-      EphemeralKey ek = EphemeralKey.create(ekParams);
+    // 4) Ephemeral Key com versão da API para o app
+    EphemeralKey ek = EphemeralKey.create(
+        EphemeralKeyCreateParams.builder()
+            .setCustomer(customerId)
+            .setStripeVersion(stripeVersion)
+            .build()
+    );
 
-      log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}",
-          subscriptionId, customerId, paymentIntentClientSecret != null);
+    log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}",
+        subscriptionId, customerId, paymentIntentClientSecret != null);
 
-      return new SubscribeResponse(
-          stripePublishableKey,
-          customerId,
-          subscriptionId,
-          paymentIntentClientSecret, // precisa estar preenchido para o PaymentSheet (GPay) pagar a fatura
-          ek.getSecret(),
-          null,        // setupIntentClientSecret (não usado no GPay imediato)
-          null         // hostedInvoiceUrl (não aplicável)
-      );
-    } finally {
-      Stripe.apiVersion = prevApiVersion; // restaura
-    }
+    return new SubscribeResponse(
+        stripePublishableKey,
+        customerId,
+        subscriptionId,
+        paymentIntentClientSecret, // usado pelo PaymentSheet (Google Pay)
+        ek.getSecret(),
+        null, // setupIntentClientSecret (não usado neste fluxo)
+        null  // hostedInvoiceUrl (não aplicável)
+    );
   }
 
   public SubscriptionStatusResponse getStatus(String subscriptionId) throws StripeException {
@@ -163,6 +155,19 @@ public class BillingService {
 
     final Subscription updated = sub.update(b.build());
     log.info("[BILL][CHANGE_PLAN] subscriptionId={}, status={}", updated.getId(), updated.getStatus());
+  }
+
+  /** Usado pelo StripeWebhookController */
+  public void applyWebhookUpdate(Subscription sub, Invoice inv) {
+    try {
+      final String subIdSafe = (sub != null) ? sub.getId() : null;
+      final String invId = (inv != null) ? inv.getId() : null;
+      final SubscriptionBackendStatus status = (sub != null) ? mapStatus(sub) : SubscriptionBackendStatus.INACTIVE;
+      log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
+      // TODO: persistir status/datas em DB e publicar eventos internos
+    } catch (Exception e) {
+      log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
+    }
   }
 
   // ---------------- helpers ----------------
