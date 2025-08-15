@@ -165,62 +165,84 @@ public class BillingService {
    * Faz polling por alguns segundos até a fatura ter um PaymentIntent com client_secret.
    */
   private String fetchInvoicePIClientSecretWithRetry(Subscription sub, Duration maxWait) throws StripeException {
-    // 1) Tentativa rápida com o que já temos expandido
-    String cs = tryExtractPIClientSecretFromSubscription(sub);
-    if (StringUtils.hasText(cs)) return cs;
-
-    // 2) Se não deu, tentamos reconsultar a fatura com expand=payment_intent e, se necessário, finalizar
     final long deadline = System.nanoTime() + maxWait.toNanos();
     int attempt = 0;
+    boolean triedFinalize = false;
 
     while (System.nanoTime() < deadline) {
       attempt++;
 
-      // Reobter invoiceId e buscar a fatura expandida
-      String invoiceId = null;
-      try { invoiceId = sub.getLatestInvoice(); } catch (Throwable ignored) {}
-      if (!StringUtils.hasText(invoiceId)) {
-        // Como fallback, recarrega a assinatura rapidamente (para atualizar latest_invoice)
-        try {
-          sub = Subscription.retrieve(sub.getId()); // sem expand aqui; vamos mirar na invoice
-          invoiceId = sub.getLatestInvoice();
-        } catch (Throwable t) {
-          log.debug("[BILL][PI-RETRY] Falha ao recarregar assinatura: {}", t.getMessage());
-        }
+      // 1) Recarrega a assinatura já com expand completo (evita depender do estado do objeto em memória)
+      try {
+        Subscription subR = Subscription.retrieve(
+            sub.getId(),
+            SubscriptionRetrieveParams.builder()
+                .addExpand("latest_invoice")
+                .addExpand("latest_invoice.payment_intent")
+                .build(),
+            null
+        );
+        sub = subR;
+      } catch (Throwable t) {
+        log.debug("[BILL][PI-RETRY] reload sub failed: {}", t.getMessage());
       }
 
-      if (StringUtils.hasText(invoiceId)) {
-        try {
-          InvoiceRetrieveParams irp = InvoiceRetrieveParams.builder()
-              .addExpand("payment_intent")
-              .build();
-          Invoice inv = Invoice.retrieve(invoiceId, irp, null);
+      // 2) Tenta extrair do objeto expandido
+      String cs = tryExtractPIClientSecretFromSubscription(sub);
+      if (StringUtils.hasText(cs)) {
+        log.info("[BILL][PI-RETRY] client_secret obtido (expand) na tentativa {}", attempt);
+        return cs;
+      }
 
-          // Se a fatura estiver em draft, finalize para garantir PI
+      // 3) Se ainda não, pega a invoice e trata status
+      Invoice inv = safeGetLatestInvoice(sub);
+      if (inv != null) {
+        String invStatus = inv.getStatus();
+        Long amountDue = safeGetAmountDue(inv);
+        Long total = safeGetTotal(inv);
+
+        // Se invoice é draft, finalize UMA vez para forçar criação do PI
+        if ("draft".equalsIgnoreCase(invStatus) && !triedFinalize) {
           try {
-            String status = inv.getStatus();
-            if ("draft".equalsIgnoreCase(status)) {
-              inv = inv.finalizeInvoice();
+            inv = inv.finalizeInvoice();
+            triedFinalize = true;
+            // tentar extrair de novo após finalizar
+            cs = tryExtractPIClientSecretFromInvoice(inv);
+            if (StringUtils.hasText(cs)) {
+              log.info("[BILL][PI-RETRY] client_secret após finalizeInvoice na tentativa {}", attempt);
+              return cs;
             }
-          } catch (Throwable ignored) {}
-
-          // Extrai o client_secret (objeto expandido ou via id)
+          } catch (Throwable t) {
+            log.debug("[BILL][PI-RETRY] finalizeInvoice falhou: {}", t.getMessage());
+          }
+        } else {
+          // Se já está open/paid/uncollectible, ainda pode não ter PI se valor é zero
           cs = tryExtractPIClientSecretFromInvoice(inv);
           if (StringUtils.hasText(cs)) {
-            log.info("[BILL][PI-RETRY] Obtido client_secret na tentativa {}", attempt);
+            log.info("[BILL][PI-RETRY] client_secret obtido (invoice) na tentativa {}", attempt);
             return cs;
           }
-        } catch (Throwable t) {
-          log.debug("[BILL][PI-RETRY] retrieve invoice {} falhou: {}", invoiceId, t.getMessage());
+
+          // Se valor é zero, não haverá PI mesmo: devolvemos null para acionar o fallback de SetupIntent
+          boolean zeroNow = (nz(amountDue) == 0L) || (nz(total) == 0L);
+          if (zeroNow) {
+            log.info("[BILL][PI-RETRY] invoice valor 0 (amount_due={}, total={}), sem PI; usar SetupIntent.", amountDue, total);
+            return null;
+          }
         }
       }
 
-      // Backoff: 200ms, 400ms, 600ms, ... (limite ~1s)
-      sleepQuiet(200L * Math.min(attempt, 5));
+      // 4) Backoff com teto, com um pequeno jitter
+      long base = 250L * Math.min(attempt, 8); // cresce até ~2s
+      long sleep = base + (long)(Math.random() * 120);
+      sleepQuiet(sleep);
     }
 
+    // Timeout sem PI → deixa o chamador decidir (fallback para SetupIntent se fizer sentido)
+    log.warn("[BILL][PI-RETRY] Timeout sem obter client_secret para sub {}", sub.getId());
     return null;
   }
+
 
   private static String tryExtractPIClientSecretFromSubscription(Subscription subscription) {
     try {
