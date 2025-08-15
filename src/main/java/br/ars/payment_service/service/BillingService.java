@@ -11,12 +11,7 @@ import com.stripe.model.Invoice;
 import com.stripe.model.PaymentIntent;
 import com.stripe.model.SetupIntent;
 import com.stripe.model.Subscription;
-import com.stripe.param.EphemeralKeyCreateParams;
-import com.stripe.param.InvoiceRetrieveParams;
-import com.stripe.param.SetupIntentCreateParams;
-import com.stripe.param.SubscriptionCreateParams;
-import com.stripe.param.SubscriptionRetrieveParams;
-import com.stripe.param.SubscriptionUpdateParams;
+import com.stripe.param.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -52,7 +47,7 @@ public class BillingService {
     this.billingCustomerService = billingCustomerService;
   }
 
-  /** Fluxo único: PaymentSheet (Google Pay/cartão) usando PaymentIntent da latest_invoice; fallback: SetupIntent(card). */
+  /** Fluxo: tenta PI da latest_invoice; se não houver, fallback para SetupIntent("card"). */
   @Transactional
   public SubscribeResponse startSubscription(SubscribeRequest req) throws StripeException {
     Stripe.apiKey = stripeSecretKey;
@@ -65,18 +60,17 @@ public class BillingService {
     log.info("[BILL][FLOW] startSubscription (GPay) userId={}, email={}, priceId={}, stripeVersion={}",
         userId, email, priceId, stripeVersion);
 
-    // 1) Customer
+    // 1) Customer por usuário
     final String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
 
-    // 2) Criar assinatura DEFAULT_INCOMPLETE (gera fatura inicial e, se valor > 0, um PaymentIntent)
+    // 2) Criar assinatura DEFAULT_INCOMPLETE para gerar PaymentIntent na fatura
     final SubscriptionCreateParams.PaymentSettings.Builder ps =
         SubscriptionCreateParams.PaymentSettings.builder()
             .setSaveDefaultPaymentMethod(
                 SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION
             );
 
-    // (Opcional / compatível com qualquer versão) — aponta que queremos "card" no PI
-    // Se o seu SDK tiver .addPaymentMethodType(...), pode usar em vez do extraParam.
+    // GPay requer 'card' habilitado na conta; mantemos isso aqui.
     ps.putExtraParam("payment_method_types", Arrays.asList("card"));
 
     final SubscriptionCreateParams params = SubscriptionCreateParams.builder()
@@ -85,7 +79,6 @@ public class BillingService {
         .setCollectionMethod(SubscriptionCreateParams.CollectionMethod.CHARGE_AUTOMATICALLY)
         .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
         .setPaymentSettings(ps.build())
-        // Expand reduz roundtrips
         .addExpand("latest_invoice")
         .addExpand("latest_invoice.payment_intent")
         .build();
@@ -93,18 +86,17 @@ public class BillingService {
     final Subscription subscription = Subscription.create(params);
     final String subscriptionId = subscription.getId();
 
-    // 3) Tentar obter o client_secret do PaymentIntent com retries curtos
+    // 3) Obter o client_secret do PaymentIntent (com retries curtos)
     String paymentIntentClientSecret = fetchInvoicePIClientSecretWithRetry(subscription, Duration.ofSeconds(12));
     String setupIntentClientSecret = null;
 
     if (!StringUtils.hasText(paymentIntentClientSecret)) {
       log.warn("[BILL][FLOW] Não foi possível obter payment_intent.client_secret da assinatura {}", subscriptionId);
-      // Fallback: criar SetupIntent(card) para salvar o cartão e permitir cobranças futuras off-session
-      // (ex.: quando a fatura inicial é R$ 0, ou invoice ficou draft por impostos/dados faltantes)
+      // Fallback: SetupIntent("card") — usado com Google Pay (forSetupIntent)
       setupIntentClientSecret = createSetupIntentCs(customerId);
     }
 
-    // 4) Ephemeral Key para o app — obrigatório setar stripeVersion
+    // 4) Ephemeral Key para o app
     EphemeralKey ek = EphemeralKey.create(
         EphemeralKeyCreateParams.builder()
             .setCustomer(customerId)
@@ -115,15 +107,15 @@ public class BillingService {
     log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}, hasSI={}",
         subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null);
 
-    // 5) Retorno: PaymentSheet usa PI se houver; senão, usa o SetupIntent (para salvar o card)
+    // 5) Retorno para o app Android (Google Pay)
     return new SubscribeResponse(
         stripePublishableKey,
         customerId,
         subscriptionId,
-        paymentIntentClientSecret,
-        ek.getSecret(),
-        setupIntentClientSecret,
-        null // hostedInvoiceUrl não aplicável neste fluxo
+        paymentIntentClientSecret,   // usado no GooglePay.presentGooglePay (cobrança)
+        ek.getSecret(),              // ephemeral key
+        setupIntentClientSecret,     // usado no GooglePay.presentGooglePay(forSetupIntent)
+        null                         // hostedInvoiceUrl (não aplicável)
     );
   }
 
@@ -160,7 +152,7 @@ public class BillingService {
     log.info("[BILL][CHANGE_PLAN] subscriptionId={}, status={}", updated.getId(), updated.getStatus());
   }
 
-  /** Usado pelo StripeWebhookController */
+  /** Chamado pelo StripeWebhookController ao processar eventos */
   public void applyWebhookUpdate(Subscription sub, Invoice inv) {
     try {
       final String subIdSafe = (sub != null) ? sub.getId() : null;
@@ -175,18 +167,18 @@ public class BillingService {
 
   // ---------------- internals ----------------
 
-  /** Cria SetupIntent forçando payment_method_types=card (necessário para salvar cartão). */
+  /** Cria SetupIntent forçando payment_method_types = "card". */
   private String createSetupIntentCs(String customerId) throws StripeException {
     SetupIntentCreateParams params = SetupIntentCreateParams.builder()
         .setCustomer(customerId)
         .setUsage(SetupIntentCreateParams.Usage.OFF_SESSION)
-        .addPaymentMethodType(SetupIntentCreateParams.PaymentMethodType.CARD) // 🔴 força "card"
+        .addPaymentMethodType("card") // compatível com stripe-java 29.x
         .build();
 
     SetupIntent si = SetupIntent.create(params);
     String cs = si.getClientSecret();
     if (!StringUtils.hasText(cs)) {
-      throw new StripeException("SetupIntent criado sem client_secret (inesperado)", null);
+      throw new IllegalStateException("SetupIntent criado sem client_secret (inesperado)");
     }
     return cs;
   }
@@ -203,7 +195,7 @@ public class BillingService {
     while (System.nanoTime() < deadline) {
       attempt++;
 
-      // 1) Recarrega a assinatura com expand (estado sempre fresco)
+      // Recarrega a assinatura com expand
       try {
         sub = Subscription.retrieve(
             sub.getId(),
@@ -217,21 +209,20 @@ public class BillingService {
         log.debug("[BILL][PI-RETRY] reload sub failed: {}", t.getMessage());
       }
 
-      // 2) Extrai do expand da assinatura
+      // Tenta extrair do expand
       String cs = tryExtractPIClientSecretFromSubscription(sub);
       if (StringUtils.hasText(cs)) {
         log.info("[BILL][PI-RETRY] client_secret obtido (expand) na tentativa {}", attempt);
         return cs;
       }
 
-      // 3) Verifica invoice diretamente
+      // Verifica invoice diretamente
       Invoice inv = safeGetLatestInvoice(sub);
       if (inv != null) {
         String invStatus = inv.getStatus();
         Long amountDue = safeGetAmountDue(inv);
         Long total = safeGetTotal(inv);
 
-        // Se invoice é draft, finalize uma vez para tentar forçar criação do PI
         if ("draft".equalsIgnoreCase(invStatus) && !triedFinalize) {
           try {
             inv = inv.finalizeInvoice();
@@ -245,7 +236,6 @@ public class BillingService {
             log.debug("[BILL][PI-RETRY] finalizeInvoice falhou: {}", t.getMessage());
           }
         } else {
-          // Se já está open/paid/uncollectible, ainda pode não ter PI se valor é zero
           cs = tryExtractPIClientSecretFromInvoice(inv);
           if (StringUtils.hasText(cs)) {
             log.info("[BILL][PI-RETRY] client_secret obtido (invoice) na tentativa {}", attempt);
@@ -254,14 +244,13 @@ public class BillingService {
 
           boolean zeroNow = (nz(amountDue) == 0L) || (nz(total) == 0L);
           if (zeroNow) {
-            log.info("[BILL][PI-RETRY] invoice valor 0 (amount_due={}, total={}), sem PI; usar SetupIntent.", amountDue, total);
-            return null; // sinaliza fallback para SI
+            log.info("[BILL][PI-RETRY] invoice valor 0 (amount_due={}, total={}), sem PI; usar SetupIntent.");
+            return null;
           }
         }
       }
 
-      // 4) Backoff (até ~2s) com jitter
-      long base = 250L * Math.min(attempt, 8);
+      long base = 250L * Math.min(attempt, 8); // até ~2s
       long sleep = base + (long)(Math.random() * 120);
       sleepQuiet(sleep);
     }
@@ -299,7 +288,7 @@ public class BillingService {
   private static String tryExtractPIClientSecretFromInvoice(Invoice inv) throws StripeException {
     if (inv == null) return null;
 
-    // 1) Se o objeto expandido existir (reflection p/ compatibilidade de versões)
+    // 1) objeto expandido
     try {
       Method mObj = Invoice.class.getMethod("getPaymentIntentObject");
       Object piObj = mObj.invoke(inv);
@@ -309,9 +298,9 @@ public class BillingService {
       }
     } catch (Throwable ignored) {}
 
-    // 2) Fallback: pegar o ID do PI e fazer retrieve
+    // 2) via ID
     try {
-      Method mId = Invoice.class.getMethod("getPaymentIntent"); // retorna String id
+      Method mId = Invoice.class.getMethod("getPaymentIntent");
       Object idObj = mId.invoke(inv);
       if (idObj instanceof String piId && StringUtils.hasText(piId)) {
         PaymentIntent pi = PaymentIntent.retrieve(piId);
