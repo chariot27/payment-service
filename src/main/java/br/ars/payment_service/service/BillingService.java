@@ -9,8 +9,11 @@ import com.stripe.exception.StripeException;
 import com.stripe.model.EphemeralKey;
 import com.stripe.model.Invoice;
 import com.stripe.model.PaymentIntent;
+import com.stripe.model.SetupIntent;
 import com.stripe.model.Subscription;
 import com.stripe.param.EphemeralKeyCreateParams;
+import com.stripe.param.InvoiceRetrieveParams;
+import com.stripe.param.SetupIntentCreateParams;
 import com.stripe.param.SubscriptionCreateParams;
 import com.stripe.param.SubscriptionUpdateParams;
 import org.slf4j.Logger;
@@ -75,31 +78,44 @@ public class BillingService {
                 )
                 .build()
         )
-        // >>> IMPORTANTE: expandir o PI ligado à fatura
+        // tentar receber já expandido
         .addExpand("latest_invoice")
         .addExpand("latest_invoice.payment_intent")
-        // <<<
         .build();
 
     final Subscription subscription = Subscription.create(params);
     final String subscriptionId = subscription.getId();
 
-    // 3) Extrair client secret (várias estratégias compatíveis com versões do stripe-java)
+    // 3) Extrair client secret do PaymentIntent (com múltiplas estratégias)
     String paymentIntentClientSecret = null;
 
     Invoice inv = null;
     try { inv = subscription.getLatestInvoiceObject(); } catch (Throwable ignored) {}
+    String invId = null;
     if (inv == null) {
+      try { invId = subscription.getLatestInvoice(); } catch (Throwable ignored) {}
+    } else {
+      try { invId = inv.getId(); } catch (Throwable ignored) {}
+    }
+
+    // Se temos ID da fatura, recupere-a de novo já com expand do PI (garante presença do campo)
+    if (!StringUtils.hasText(invId)) {
+      try { invId = subscription.getLatestInvoice(); } catch (Throwable ignored) {}
+    }
+    if (StringUtils.hasText(invId)) {
       try {
-        String invId = subscription.getLatestInvoice();
-        if (StringUtils.hasText(invId)) {
-          inv = Invoice.retrieve(invId);
-        }
-      } catch (Throwable ignored) {}
+        InvoiceRetrieveParams r = InvoiceRetrieveParams.builder()
+            .addExpand("payment_intent")
+            .build();
+        inv = Invoice.retrieve(invId, r, null);
+      } catch (Throwable e) {
+        log.warn("[BILL] Falha ao retrieve invoice {} com expand: {}", invId, e.toString());
+        try { inv = Invoice.retrieve(invId); } catch (Throwable ignored) {}
+      }
     }
 
     if (inv != null) {
-      // 3.1) Tenta confirmation_secret (se o campo existir para sua versão de API/conta)
+      // 3.1) Tenta confirmation_secret (se disponível para sua versão da API)
       try {
         Invoice.ConfirmationSecret cs = inv.getConfirmationSecret();
         if (cs != null && StringUtils.hasText(cs.getClientSecret())) {
@@ -107,7 +123,7 @@ public class BillingService {
         }
       } catch (Throwable ignored) {}
 
-      // 3.2) Fallback: tentar inv.getPaymentIntentObject().getClientSecret() via reflection
+      // 3.2) Tenta inv.getPaymentIntentObject().getClientSecret() via reflection (compatibilidade)
       if (paymentIntentClientSecret == null) {
         try {
           Object piObj = tryInvokeNoArgs(inv, "getPaymentIntentObject");
@@ -120,7 +136,7 @@ public class BillingService {
         } catch (Throwable ignored) {}
       }
 
-      // 3.3) Fallback final: tentar inv.getPaymentIntent() (id) -> PaymentIntent.retrieve(id)
+      // 3.3) Tenta inv.getPaymentIntent() (id) -> retrieve -> getClientSecret()
       if (paymentIntentClientSecret == null) {
         try {
           Object idObj = tryInvokeNoArgs(inv, "getPaymentIntent");
@@ -137,7 +153,7 @@ public class BillingService {
       }
     }
 
-    // 4) Ephemeral Key (no servidor) para o app mobile
+    // 4) Ephemeral Key para o app mobile
     final EphemeralKey ek = EphemeralKey.create(
         EphemeralKeyCreateParams.builder()
             .setCustomer(customerId)
@@ -145,23 +161,40 @@ public class BillingService {
             .build()
     );
 
-    log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}",
-        subscriptionId, customerId, paymentIntentClientSecret != null);
+    // 5) Fallback: se não veio PI (casos com fatura sem cobrança imediata, variações de API), crie um SetupIntent
+    String setupIntentClientSecret = null;
+    if (!StringUtils.hasText(paymentIntentClientSecret)) {
+      try {
+        SetupIntentCreateParams siParams = SetupIntentCreateParams.builder()
+            .setCustomer(customerId)
+            .setUsage(SetupIntentCreateParams.Usage.OFF_SESSION)
+            // deixar Stripe escolher métodos automaticamente; “card” funciona universalmente
+            .addPaymentMethodType("card")
+            .build();
+        SetupIntent si = SetupIntent.create(siParams);
+        setupIntentClientSecret = si.getClientSecret();
+        log.info("[BILL][FLOW][FALLBACK] sem PI -> gerado SetupIntent {}", si.getId());
+      } catch (Throwable e) {
+        log.warn("[BILL][FLOW][FALLBACK][ERR] falha ao criar SetupIntent: {}", e.toString());
+      }
+    }
+
+    log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}, hasSI={}",
+        subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null);
 
     return new SubscribeResponse(
         stripePublishableKey,
         customerId,
         subscriptionId,
-        paymentIntentClientSecret, // PaymentSheet paga a fatura inicial
+        paymentIntentClientSecret,     // usado pelo PaymentSheet para pagar a fatura inicial
         ek.getSecret(),
-        null, // setupIntentClientSecret (não usado neste fluxo)
-        null  // hostedInvoiceUrl (não aplicável neste fluxo)
+        setupIntentClientSecret,       // fallback: coletar/guardar método de pagamento
+        null                           // hostedInvoiceUrl (não aplicável neste fluxo)
     );
   }
 
   /** Mantém compatibilidade com o controller atual. */
   public SubscriptionStatusResponse getStatusAndUpsert(String subscriptionId) throws StripeException {
-    // Se precisar, faça upsert em DB aqui. Por ora, retornamos direto do Stripe.
     return getStatus(subscriptionId);
   }
 
@@ -170,9 +203,7 @@ public class BillingService {
     final Subscription sub = Subscription.retrieve(subscriptionId);
     final SubscriptionBackendStatus status = mapStatus(sub);
 
-    // Alguns jars do stripe-java não expõem getCurrentPeriodEnd(); retornamos nulo com segurança.
-    String currentPeriodEndIso = null;
-
+    String currentPeriodEndIso = null; // seguro para versões onde campo não está exposto
     boolean cancelAtPeriodEnd = false;
     try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); } catch (Throwable ignored) {}
 
@@ -200,14 +231,13 @@ public class BillingService {
     log.info("[BILL][CHANGE_PLAN] subscriptionId={}, status={}", updated.getId(), updated.getStatus());
   }
 
-  /** Usado pelo StripeWebhookController */
   public void applyWebhookUpdate(Subscription sub, Invoice inv) {
     try {
       final String subIdSafe = (sub != null) ? sub.getId() : null;
       final String invId = (inv != null) ? inv.getId() : null;
       final SubscriptionBackendStatus status = (sub != null) ? mapStatus(sub) : SubscriptionBackendStatus.INACTIVE;
       log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
-      // TODO: persistir status/datas em DB e publicar eventos internos
+      // TODO: persistir em DB e publicar eventos internos
     } catch (Exception e) {
       log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
