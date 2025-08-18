@@ -19,8 +19,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
-import java.time.Instant;
-
 @Service
 public class BillingService {
 
@@ -75,14 +73,12 @@ public class BillingService {
                 .build()
         )
         .addExpand("latest_invoice")
-        // A expansão do PI não é mais necessária para obter o client_secret;
-        // vamos usar Invoice.confirmation_secret (caminho suportado/estável).
         .build();
 
     final Subscription subscription = Subscription.create(params);
     final String subscriptionId = subscription.getId();
 
-    // 3) Extrair client secret para o PaymentSheet via confirmation_secret (29.4.0+)
+    // 3) Extrair client secret via confirmation_secret (sem depender de PaymentIntent getters)
     String paymentIntentClientSecret = null;
 
     Invoice inv = null;
@@ -105,7 +101,7 @@ public class BillingService {
       } catch (Throwable ignored) {}
     }
 
-    // 4) Ephemeral Key (criado NO SERVIDOR) para o app mobile
+    // 4) Ephemeral Key (no servidor) para o app mobile
     final EphemeralKey ek = EphemeralKey.create(
         EphemeralKeyCreateParams.builder()
             .setCustomer(customerId)
@@ -120,16 +116,16 @@ public class BillingService {
         stripePublishableKey,
         customerId,
         subscriptionId,
-        paymentIntentClientSecret, // usado pelo PaymentSheet para pagar a fatura inicial
+        paymentIntentClientSecret, // PaymentSheet paga a fatura inicial
         ek.getSecret(),
         null, // setupIntentClientSecret (não usado neste fluxo)
         null  // hostedInvoiceUrl (não aplicável neste fluxo)
     );
   }
 
-  /** Compatível com o controller atual: consulta e (se quiser) persiste localmente. */
+  /** Mantém compatibilidade com o controller atual. */
   public SubscriptionStatusResponse getStatusAndUpsert(String subscriptionId) throws StripeException {
-    // Aqui você pode fazer upsert em DB/eventos internos se necessário.
+    // Se precisar, faça upsert em DB aqui. Por ora, retornamos direto do Stripe.
     return getStatus(subscriptionId);
   }
 
@@ -138,13 +134,11 @@ public class BillingService {
     final Subscription sub = Subscription.retrieve(subscriptionId);
     final SubscriptionBackendStatus status = mapStatus(sub);
 
+    // Alguns jars do stripe-java não expõem getCurrentPeriodEnd(); retornamos nulo com segurança.
     String currentPeriodEndIso = null;
+
     boolean cancelAtPeriodEnd = false;
     try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); } catch (Throwable ignored) {}
-    try {
-      Long ts = sub.getCurrentPeriodEnd(); // epoch seconds
-      if (ts != null && ts > 0) currentPeriodEndIso = Instant.ofEpochSecond(ts).toString();
-    } catch (Throwable ignored) {}
 
     return new SubscriptionStatusResponse(subscriptionId, status, currentPeriodEndIso, cancelAtPeriodEnd);
   }
