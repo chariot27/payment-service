@@ -18,6 +18,15 @@ import com.stripe.param.PaymentIntentConfirmParams;
 import com.stripe.param.SubscriptionCreateParams;
 import com.stripe.param.SubscriptionRetrieveParams;
 import com.stripe.param.SubscriptionUpdateParams;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -45,7 +54,17 @@ public class BillingService {
   @Value("${app.stripe.mobile-api-version:2020-08-27}")
   private String mobileApiVersionDefault;
 
+  /** Opcional: força uma Stripe-Version moderna no fallback HTTP (mantém compat com o SDK antigo). */
+  @Value("${app.stripe.http-api-version:2023-10-16}")
+  private String httpApiVersion;
+
   private final BillingCustomerService billingCustomerService;
+
+  private final HttpClient http = HttpClient.newBuilder()
+      .version(HttpClient.Version.HTTP_2)
+      .build();
+
+  private final ObjectMapper json = new ObjectMapper();
 
   public BillingService(BillingCustomerService billingCustomerService) {
     this.billingCustomerService = billingCustomerService;
@@ -89,7 +108,7 @@ public class BillingService {
     final Subscription subCreated = Subscription.create(params);
     final String subscriptionId = subCreated.getId();
 
-    // 3) Segundo retrieve COM as expansões corretas (garante objetos populados)
+    // 3) Segundo retrieve COM as expansões corretas (garante objetos populados quando o SDK permite)
     final SubscriptionRetrieveParams srp = SubscriptionRetrieveParams.builder()
         .addExpand("latest_invoice")
         .addExpand("latest_invoice.payment_intent")
@@ -97,9 +116,9 @@ public class BillingService {
         .build();
     final Subscription sub = Subscription.retrieve(subscriptionId, srp, (RequestOptions) null);
 
-    // 4) Tenta extrair PI client_secret da fatura inicial
-    String paymentIntentClientSecret = null;
+    // 4) Obter a Invoice
     Invoice inv = safeGetLatestInvoice(sub);
+    String invIdForLog = (inv != null ? inv.getId() : null);
     if (inv == null) {
       final String invId = sub.getLatestInvoice();
       if (StringUtils.hasText(invId)) {
@@ -107,19 +126,36 @@ public class BillingService {
             .addExpand("payment_intent")
             .build();
         inv = Invoice.retrieve(invId, irp, (RequestOptions) null);
+        invIdForLog = inv != null ? inv.getId() : invId;
       }
     }
-    paymentIntentClientSecret = tryExtractClientSecretFromInvoice(inv);
 
-    // 5) Se não houver PI, tenta SetupIntent pendente da assinatura
+    // 5) Tenta extrair PI client_secret (SDK / reflexão)
+    String paymentIntentClientSecret = tryExtractClientSecretFromInvoice(inv);
+
+    // 6) Se ainda não veio via SDK, tenta via HTTP direto
+    if (!StringUtils.hasText(paymentIntentClientSecret) && StringUtils.hasText(invIdForLog)) {
+      paymentIntentClientSecret = fetchPaymentIntentSecretHttp(invIdForLog);
+    }
+
+    // 7) Se não houver PI, tenta SetupIntent (SDK / reflexão / HTTP)
     String setupIntentClientSecret = null;
     String siIdForLog = null;
+
     if (!StringUtils.hasText(paymentIntentClientSecret)) {
       setupIntentClientSecret = tryExtractSetupIntentClientSecret(sub);
       siIdForLog = tryGetPendingSetupIntentId(sub);
+
+      if (!StringUtils.hasText(setupIntentClientSecret)) {
+        setupIntentClientSecret = fetchSetupIntentSecretHttp(subscriptionId);
+        // siId só para log quando veio por HTTP
+        if (!StringUtils.hasText(siIdForLog) && StringUtils.hasText(setupIntentClientSecret)) {
+          siIdForLog = "(via-http)";
+        }
+      }
     }
 
-    // 6) Ephemeral Key para o app
+    // 8) Ephemeral Key para o app
     final EphemeralKey ek = EphemeralKey.create(
         EphemeralKeyCreateParams.builder()
             .setCustomer(customerId)
@@ -127,7 +163,6 @@ public class BillingService {
             .build()
     );
 
-    final String invIdForLog = (inv != null ? inv.getId() : null);
     log.info("[BILL][FLOW][RES] subId={}, customerId={}, invId={}, hasPI={}, siId={}, hasSI={}",
         subscriptionId, customerId, invIdForLog, paymentIntentClientSecret != null, siIdForLog, setupIntentClientSecret != null);
 
@@ -218,7 +253,7 @@ public class BillingService {
     }
   }
 
-  // ---------------- helpers ----------------
+  // ---------------- helpers (SDK/reflection) ----------------
 
   private static String require(String v, String field) {
     if (!StringUtils.hasText(v)) throw new IllegalArgumentException(field + " é obrigatório");
@@ -267,7 +302,7 @@ public class BillingService {
   private static String tryExtractClientSecretFromInvoice(Invoice inv) throws StripeException {
     if (inv == null) return null;
 
-    // 1) confirmation_secret (quando disponível)
+    // 1) confirmation_secret (quando disponível no SDK)
     try {
       Method mCs = inv.getClass().getMethod("getConfirmationSecret");
       Object cs = mCs.invoke(inv);
@@ -357,5 +392,153 @@ public class BillingService {
       if (siObj instanceof SetupIntent si) return si.getId();
     } catch (Throwable ignored) {}
     return null;
+  }
+
+  // ---------------- fallbacks HTTP diretos na API Stripe ----------------
+
+  /** Busca o client_secret do PaymentIntent da fatura via HTTP, independente do SDK. */
+  private String fetchPaymentIntentSecretHttp(String invoiceId) {
+    try {
+      final String url = "https://api.stripe.com/v1/invoices/" +
+          URLEncoder.encode(invoiceId, StandardCharsets.UTF_8) +
+          "?expand[]=payment_intent";
+
+      HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
+          .header("Authorization", "Bearer " + stripeSecretKey)
+          .header("User-Agent", "ars-payment-service/1.0")
+          .header("Content-Type", "application/x-www-form-urlencoded")
+          .GET();
+
+      if (StringUtils.hasText(httpApiVersion)) {
+        b.header("Stripe-Version", httpApiVersion);
+      }
+
+      HttpResponse<String> res = http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+      if (res.statusCode() >= 200 && res.statusCode() < 300) {
+        JsonNode root = json.readTree(res.body());
+        JsonNode piNode = root.get("payment_intent");
+        if (piNode != null) {
+          if (piNode.isObject()) {
+            String secret = textOrNull(piNode.get("client_secret"));
+            if (StringUtils.hasText(secret)) return secret;
+            // como fallback, se vier objeto sem secret, pega id e busca /payment_intents/{id}
+            String piId = textOrNull(piNode.get("id"));
+            if (StringUtils.hasText(piId)) {
+              return fetchPaymentIntentSecretByIdHttp(piId);
+            }
+          } else if (piNode.isTextual()) {
+            return fetchPaymentIntentSecretByIdHttp(piNode.asText());
+          }
+        }
+      } else {
+        log.warn("[BILL][HTTP][INV] status={} body={}", res.statusCode(), res.body());
+      }
+    } catch (Exception e) {
+      log.warn("[BILL][HTTP][INV][ERR] {}", e.toString());
+    }
+    return null;
+  }
+
+  private String fetchPaymentIntentSecretByIdHttp(String piId) {
+    if (!StringUtils.hasText(piId)) return null;
+    try {
+      final String url = "https://api.stripe.com/v1/payment_intents/" +
+          URLEncoder.encode(piId, StandardCharsets.UTF_8);
+
+      HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
+          .header("Authorization", "Bearer " + stripeSecretKey)
+          .header("User-Agent", "ars-payment-service/1.0")
+          .header("Content-Type", "application/x-www-form-urlencoded")
+          .GET();
+
+      if (StringUtils.hasText(httpApiVersion)) {
+        b.header("Stripe-Version", httpApiVersion);
+      }
+
+      HttpResponse<String> res = http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+      if (res.statusCode() >= 200 && res.statusCode() < 300) {
+        JsonNode root = json.readTree(res.body());
+        String secret = textOrNull(root.get("client_secret"));
+        if (StringUtils.hasText(secret)) return secret;
+      } else {
+        log.warn("[BILL][HTTP][PI] status={} body={}", res.statusCode(), res.body());
+      }
+    } catch (Exception e) {
+      log.warn("[BILL][HTTP][PI][ERR] {}", e.toString());
+    }
+    return null;
+  }
+
+  /** Se não houver PI (ex.: trial sem cobrança inicial), pega o pending_setup_intent da assinatura. */
+  private String fetchSetupIntentSecretHttp(String subscriptionId) {
+    if (!StringUtils.hasText(subscriptionId)) return null;
+    try {
+      final String url = "https://api.stripe.com/v1/subscriptions/" +
+          URLEncoder.encode(subscriptionId, StandardCharsets.UTF_8) +
+          "?expand[]=pending_setup_intent";
+
+      HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
+          .header("Authorization", "Bearer " + stripeSecretKey)
+          .header("User-Agent", "ars-payment-service/1.0")
+          .header("Content-Type", "application/x-www-form-urlencoded")
+          .GET();
+
+      if (StringUtils.hasText(httpApiVersion)) {
+        b.header("Stripe-Version", httpApiVersion);
+      }
+
+      HttpResponse<String> res = http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+      if (res.statusCode() >= 200 && res.statusCode() < 300) {
+        JsonNode root = json.readTree(res.body());
+        JsonNode siNode = root.get("pending_setup_intent");
+        if (siNode != null) {
+          if (siNode.isObject()) {
+            String secret = textOrNull(siNode.get("client_secret"));
+            if (StringUtils.hasText(secret)) return secret;
+          } else if (siNode.isTextual()) {
+            return fetchSetupIntentSecretByIdHttp(siNode.asText());
+          }
+        }
+      } else {
+        log.warn("[BILL][HTTP][SUB] status={} body={}", res.statusCode(), res.body());
+      }
+    } catch (Exception e) {
+      log.warn("[BILL][HTTP][SUB][ERR] {}", e.toString());
+    }
+    return null;
+  }
+
+  private String fetchSetupIntentSecretByIdHttp(String siId) {
+    if (!StringUtils.hasText(siId)) return null;
+    try {
+      final String url = "https://api.stripe.com/v1/setup_intents/" +
+          URLEncoder.encode(siId, StandardCharsets.UTF_8);
+
+      HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
+          .header("Authorization", "Bearer " + stripeSecretKey)
+          .header("User-Agent", "ars-payment-service/1.0")
+          .header("Content-Type", "application/x-www-form-urlencoded")
+          .GET();
+
+      if (StringUtils.hasText(httpApiVersion)) {
+        b.header("Stripe-Version", httpApiVersion);
+      }
+
+      HttpResponse<String> res = http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+      if (res.statusCode() >= 200 && res.statusCode() < 300) {
+        JsonNode root = json.readTree(res.body());
+        String secret = textOrNull(root.get("client_secret"));
+        if (StringUtils.hasText(secret)) return secret;
+      } else {
+        log.warn("[BILL][HTTP][SI] status={} body={}", res.statusCode(), res.body());
+      }
+    } catch (Exception e) {
+      log.warn("[BILL][HTTP][SI][ERR] {}", e.toString());
+    }
+    return null;
+  }
+
+  private static String textOrNull(JsonNode n) {
+    return (n != null && !n.isNull()) ? n.asText(null) : null;
   }
 }
