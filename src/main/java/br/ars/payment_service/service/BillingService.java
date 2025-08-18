@@ -23,6 +23,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
+import java.lang.reflect.Method;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -54,10 +55,10 @@ public class BillingService {
 
   /**
    * Fluxo SEM TRIAL:
-   *  - Cria Subscription com DEFAULT_INCOMPLETE + expand latest_invoice.payment_intent
-   *  - Faz polling curto até o invoice ter payment_intent com client_secret
-   *  - Retorna o PI client_secret para a PaymentSheet
-   *  - NÃO cai para SetupIntent (evita confundir status como INCOMPLETE)
+   * - Cria Subscription com DEFAULT_INCOMPLETE + expand latest_invoice.payment_intent
+   * - Polling até o invoice ter PaymentIntent com client_secret
+   * - Retorna o PI client_secret para a PaymentSheet
+   * - Sem fallback para SetupIntent (evita cair em hasSI=true)
    */
   @Transactional
   public SubscribeResponse startSubscription(SubscribeRequest req) throws StripeException {
@@ -94,14 +95,12 @@ public class BillingService {
     String piClientSecret = fetchPIClientSecretBlocking(sub, Duration.ofSeconds(30));
     if (!StringUtils.hasText(piClientSecret)) {
       log.warn("[BILL][FLOW] Não foi possível obter payment_intent.client_secret da assinatura {} dentro do timeout", subscriptionId);
-      // Se quiser manter fallback para SetupIntent (não recomendado para “sem trial”), descomente:
-      // String si = createSetupIntentCs(customerId);
-      // return new SubscribeResponse(stripePublishableKey, customerId, subscriptionId, null, createEphemeralKey(customerId, stripeVersion), si, null);
+      // Sem fallback para SetupIntent no fluxo sem trial:
       throw new IllegalStateException("Falha ao preparar pagamento inicial. Tente novamente.");
     }
 
-    // 4) Ephemeral Key na versão do mobile
-    final String ephKeySecret = createEphemeralKey(customerId, stripeVersion);
+    // 4) Ephemeral Key na versão do mobile (compatível com libs antigas/novas)
+    final String ephKeySecret = createEphemeralKeyCompat(customerId, stripeVersion);
 
     log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI=true, hasSI=false", subscriptionId, customerId);
 
@@ -117,7 +116,7 @@ public class BillingService {
     );
   }
 
-  /** Consulta status atual no Stripe e devolve DTO (pode opcionalmente upsert no DB se desejar). */
+  /** Consulta status atual no Stripe e devolve DTO. */
   public SubscriptionStatusResponse getStatus(String subscriptionId) throws StripeException {
     Stripe.apiKey = stripeSecretKey;
 
@@ -130,7 +129,7 @@ public class BillingService {
 
     String currentPeriodEndIso = null;
     try {
-      Long epoch = sub.getCurrentPeriodEnd();
+      Long epoch = tryGetLong(sub, "getCurrentPeriodEnd");
       if (epoch != null) {
         currentPeriodEndIso = Instant.ofEpochSecond(epoch)
             .atOffset(ZoneOffset.UTC)
@@ -139,9 +138,22 @@ public class BillingService {
     } catch (Throwable ignored) {}
 
     boolean cancelAtPeriodEnd = false;
-    try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); } catch (Throwable ignored) {}
+    try {
+      Boolean cpe = tryGetBoolean(sub, "getCancelAtPeriodEnd");
+      cancelAtPeriodEnd = Boolean.TRUE.equals(cpe);
+    } catch (Throwable ignored) {}
 
     return new SubscriptionStatusResponse(subscriptionId, status, currentPeriodEndIso, cancelAtPeriodEnd);
+  }
+
+  /**
+   * Compat: alguns controladores podem chamar getStatusAndUpsert.
+   * Aqui apenas delegamos para getStatus e (se quiser) faça um upsert no seu repositório.
+   */
+  public SubscriptionStatusResponse getStatusAndUpsert(String subscriptionId) throws StripeException {
+    SubscriptionStatusResponse res = getStatus(subscriptionId);
+    // TODO opcional: persistir/atualizar no banco para refleter status imediatamente.
+    return res;
   }
 
   public void changePlan(String subscriptionId, String newPriceId, String prorationBehaviorRaw) throws StripeException {
@@ -174,8 +186,6 @@ public class BillingService {
       log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
 
       // TODO: upsert no seu banco (userId ↔ subscriptionId), datas (current_period_end), cancelAtPeriodEnd etc.
-      // ex.: subscriptionRepo.upsert(...)
-
     } catch (Exception e) {
       log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
@@ -199,7 +209,7 @@ public class BillingService {
     while (System.nanoTime() < deadline) {
       attempt++;
 
-      // (A) Tenta via subscription expand
+      // (A) via subscription expand
       try {
         sub = Subscription.retrieve(
             sub.getId(),
@@ -209,9 +219,9 @@ public class BillingService {
                 .build(),
             null
         );
-        Invoice inv = sub.getLatestInvoiceObject();
+        Invoice inv = sub.getLatestInvoiceObject(); // pode ser null em SDKs antigos
         if (inv != null) {
-          PaymentIntent pi = inv.getPaymentIntent();
+          PaymentIntent pi = getPaymentIntentCompat(inv);
           if (pi != null && StringUtils.hasText(pi.getClientSecret())) {
             log.info("[BILL][PI] CS via subscription expand (tentativa {})", attempt);
             return pi.getClientSecret();
@@ -221,28 +231,30 @@ public class BillingService {
         log.debug("[BILL][PI] subscription expand falhou: {}", t.getMessage());
       }
 
-      // (B) Tenta via retrieve direto da invoice com expand=payment_intent
+      // (B) via retrieve direto da invoice com expand=payment_intent (compat)
       try {
-        String invId = sub.getLatestInvoice();
+        String invId = null;
+        try {
+          invId = sub.getLatestInvoice(); // em alguns SDKs isso existe
+        } catch (Throwable ignore) { /* fica null */ }
+
         if (StringUtils.hasText(invId)) {
           Invoice inv = Invoice.retrieve(
               invId,
               InvoiceRetrieveParams.builder().addExpand("payment_intent").build(),
               null
           );
-          if (inv != null) {
-            PaymentIntent pi = inv.getPaymentIntent();
-            if (pi != null && StringUtils.hasText(pi.getClientSecret())) {
-              log.info("[BILL][PI] CS via invoice expand (tentativa {})", attempt);
-              return pi.getClientSecret();
-            }
+          PaymentIntent pi = getPaymentIntentCompat(inv);
+          if (pi != null && StringUtils.hasText(pi.getClientSecret())) {
+            log.info("[BILL][PI] CS via invoice expand (tentativa {})", attempt);
+            return pi.getClientSecret();
           }
         }
       } catch (Throwable t) {
         log.debug("[BILL][PI] invoice expand falhou: {}", t.getMessage());
       }
 
-      // (C) Aguardar um pouco e repetir
+      // (C) espera incremental
       long backoffMs = Math.min(2000L, 250L * attempt);
       try { Thread.sleep(backoffMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
@@ -251,16 +263,56 @@ public class BillingService {
     return null;
   }
 
-  private String createEphemeralKey(String customerId, String stripeVersion) throws StripeException {
+  /** Obtém PaymentIntent do Invoice de forma compatível com diferentes versões do SDK. */
+  private static PaymentIntent getPaymentIntentCompat(Invoice inv) throws StripeException {
+    if (inv == null) return null;
+
+    // 1) Tenta getPaymentIntentObject()
+    try {
+      Method mObj = Invoice.class.getMethod("getPaymentIntentObject");
+      Object piObj = mObj.invoke(inv);
+      if (piObj instanceof PaymentIntent) {
+        return (PaymentIntent) piObj;
+      }
+    } catch (Throwable ignored) {}
+
+    // 2) Tenta getPaymentIntent() -> String id
+    try {
+      Method mId = Invoice.class.getMethod("getPaymentIntent");
+      Object idObj = mId.invoke(inv);
+      if (idObj instanceof String piId && StringUtils.hasText(piId)) {
+        return PaymentIntent.retrieve(piId);
+      }
+    } catch (Throwable ignored) {}
+
+    return null;
+  }
+
+  /** Cria EphemeralKey configurando a Stripe-Version de forma compatível (override ou legacy). */
+  private String createEphemeralKeyCompat(String customerId, String stripeVersion) throws StripeException {
     EphemeralKeyCreateParams params = EphemeralKeyCreateParams.builder()
         .setCustomer(customerId)
         .build();
 
-    // A maneira suportada para “forçar” a versão do mobile é via RequestOptions.setStripeVersionOverride
-    RequestOptions ro = RequestOptions.builder()
-        .setStripeVersionOverride(stripeVersion)
-        .build();
+    RequestOptions.RequestOptionsBuilder rb = RequestOptions.builder();
 
+    // Tenta usar setStripeVersionOverride (SDKs mais novos); se não existir, tenta setStripeVersion; se nada, segue sem override.
+    boolean versionSet = false;
+    try {
+      Method m = rb.getClass().getMethod("setStripeVersionOverride", String.class);
+      m.invoke(rb, stripeVersion);
+      versionSet = true;
+    } catch (Throwable ignored) {}
+
+    if (!versionSet) {
+      try {
+        Method m2 = rb.getClass().getMethod("setStripeVersion", String.class);
+        m2.invoke(rb, stripeVersion);
+        versionSet = true;
+      } catch (Throwable ignored) {}
+    }
+
+    RequestOptions ro = rb.build();
     EphemeralKey ek = EphemeralKey.create(params, ro);
     if (ek == null || !StringUtils.hasText(ek.getSecret())) {
       throw new IllegalStateException("Falha ao criar EphemeralKey");
@@ -295,5 +347,30 @@ public class BillingService {
       case "always_invoice" -> SubscriptionUpdateParams.ProrationBehavior.ALWAYS_INVOICE;
       default -> null;
     };
+  }
+
+  /** Tenta invocar um getter booleano via reflection; retorna null se não existir. */
+  private static Boolean tryGetBoolean(Object target, String method) {
+    try {
+      Method m = target.getClass().getMethod(method);
+      Object val = m.invoke(target);
+      if (val instanceof Boolean b) return b;
+      return null;
+    } catch (Throwable t) {
+      return null;
+    }
+  }
+
+  /** Tenta invocar um getter Long via reflection; retorna null se não existir. */
+  private static Long tryGetLong(Object target, String method) {
+    try {
+      Method m = target.getClass().getMethod(method);
+      Object val = m.invoke(target);
+      if (val instanceof Long l) return l;
+      if (val instanceof Number n) return n.longValue();
+      return null;
+    } catch (Throwable t) {
+      return null;
+    }
   }
 }
