@@ -24,29 +24,28 @@ public class BillingController {
     this.billingService = billingService;
   }
 
-  /** POST /api/billing/subscribe — cria assinatura DEFAULT_INCOMPLETE e retorna dados para PaymentSheet */
+  /** Cria assinatura DEFAULT_INCOMPLETE e devolve dados para a PaymentSheet (PI ou SI). */
   @PostMapping(path = "/subscribe", consumes = MediaType.APPLICATION_JSON_VALUE)
   public ResponseEntity<SubscribeResponse> subscribe(@RequestBody SubscribeRequest request) throws StripeException {
     SubscribeResponse res = billingService.startSubscription(request);
     return ResponseEntity.ok(res);
   }
 
-  /** POST /api/billing/confirm — confirmação manual do PaymentIntent (opcional) */
+  /** Confirma manualmente o PaymentIntent inicial (opcional; não usado para SetupIntent). */
   @PostMapping(path = "/confirm", consumes = MediaType.APPLICATION_JSON_VALUE)
   public ResponseEntity<Void> confirm(@RequestBody ConfirmPaymentRequest req) throws StripeException {
-    // ATENÇÃO: o service retorna void. NÃO tente usar o retorno como SubscriptionStatusResponse.
     billingService.confirmInitialPayment(req.subscriptionId(), req.paymentMethodId());
     return ResponseEntity.noContent().build();
   }
 
-  /** GET /api/billing/subscriptions/{id} — consulta status no Stripe */
+  /** Consulta status direto no Stripe. */
   @GetMapping("/subscriptions/{id}")
   public ResponseEntity<SubscriptionStatusResponse> getStatus(@PathVariable("id") String subscriptionId) throws StripeException {
     SubscriptionStatusResponse res = billingService.getStatusAndUpsert(subscriptionId);
     return ResponseEntity.ok(res);
   }
 
-  /** Troca de plano */
+  /** Troca de plano. */
   @PostMapping(path = "/change-plan", consumes = MediaType.APPLICATION_JSON_VALUE)
   public ResponseEntity<Void> changePlan(@RequestBody ChangePlanRequest req) throws StripeException {
     billingService.changePlan(req.subscriptionId(), req.newPriceId(), req.prorationBehavior());
