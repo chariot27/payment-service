@@ -13,6 +13,7 @@ import com.stripe.model.SetupIntent;
 import com.stripe.model.Subscription;
 import com.stripe.param.EphemeralKeyCreateParams;
 import com.stripe.param.InvoiceRetrieveParams;
+import com.stripe.param.InvoicePayParams;
 import com.stripe.param.SetupIntentCreateParams;
 import com.stripe.param.SubscriptionCreateParams;
 import com.stripe.param.SubscriptionUpdateParams;
@@ -78,7 +79,6 @@ public class BillingService {
                 )
                 .build()
         )
-        // tentar receber já expandido
         .addExpand("latest_invoice")
         .addExpand("latest_invoice.payment_intent")
         .build();
@@ -98,10 +98,6 @@ public class BillingService {
       try { invId = inv.getId(); } catch (Throwable ignored) {}
     }
 
-    // Se temos ID da fatura, recupere-a de novo já com expand do PI (garante presença do campo)
-    if (!StringUtils.hasText(invId)) {
-      try { invId = subscription.getLatestInvoice(); } catch (Throwable ignored) {}
-    }
     if (StringUtils.hasText(invId)) {
       try {
         InvoiceRetrieveParams r = InvoiceRetrieveParams.builder()
@@ -115,7 +111,7 @@ public class BillingService {
     }
 
     if (inv != null) {
-      // 3.1) Tenta confirmation_secret (se disponível para sua versão da API)
+      // 3.1) confirmation_secret (se disponível na versão da API)
       try {
         Invoice.ConfirmationSecret cs = inv.getConfirmationSecret();
         if (cs != null && StringUtils.hasText(cs.getClientSecret())) {
@@ -123,20 +119,18 @@ public class BillingService {
         }
       } catch (Throwable ignored) {}
 
-      // 3.2) Tenta inv.getPaymentIntentObject().getClientSecret() via reflection (compatibilidade)
+      // 3.2) inv.getPaymentIntentObject().getClientSecret() via reflection (compat)
       if (paymentIntentClientSecret == null) {
         try {
           Object piObj = tryInvokeNoArgs(inv, "getPaymentIntentObject");
           if (piObj instanceof PaymentIntent) {
             String cs = ((PaymentIntent) piObj).getClientSecret();
-            if (StringUtils.hasText(cs)) {
-              paymentIntentClientSecret = cs;
-            }
+            if (StringUtils.hasText(cs)) paymentIntentClientSecret = cs;
           }
         } catch (Throwable ignored) {}
       }
 
-      // 3.3) Tenta inv.getPaymentIntent() (id) -> retrieve -> getClientSecret()
+      // 3.3) inv.getPaymentIntent() (id) -> retrieve -> getClientSecret()
       if (paymentIntentClientSecret == null) {
         try {
           Object idObj = tryInvokeNoArgs(inv, "getPaymentIntent");
@@ -161,14 +155,13 @@ public class BillingService {
             .build()
     );
 
-    // 5) Fallback: se não veio PI (casos com fatura sem cobrança imediata, variações de API), crie um SetupIntent
+    // 5) Fallback: sem PI -> cria SetupIntent para coletar/guardar método
     String setupIntentClientSecret = null;
     if (!StringUtils.hasText(paymentIntentClientSecret)) {
       try {
         SetupIntentCreateParams siParams = SetupIntentCreateParams.builder()
             .setCustomer(customerId)
             .setUsage(SetupIntentCreateParams.Usage.OFF_SESSION)
-            // deixar Stripe escolher métodos automaticamente; “card” funciona universalmente
             .addPaymentMethodType("card")
             .build();
         SetupIntent si = SetupIntent.create(siParams);
@@ -186,11 +179,45 @@ public class BillingService {
         stripePublishableKey,
         customerId,
         subscriptionId,
-        paymentIntentClientSecret,     // usado pelo PaymentSheet para pagar a fatura inicial
+        paymentIntentClientSecret,     // PaymentSheet (PI) paga a fatura inicial
         ek.getSecret(),
-        setupIntentClientSecret,       // fallback: coletar/guardar método de pagamento
-        null                           // hostedInvoiceUrl (não aplicável neste fluxo)
+        setupIntentClientSecret,       // Fallback (SI): coletar cartão e depois pagar via endpoint abaixo
+        null
     );
+  }
+
+  /** Cliente confirmou o SetupIntent; usamos o paymentMethodId para pagar a fatura inicial. */
+  public SubscriptionStatusResponse confirmInitialPayment(String subscriptionId, String paymentMethodId) throws StripeException {
+    Stripe.apiKey = stripeSecretKey;
+
+    if (!StringUtils.hasText(subscriptionId)) throw new IllegalArgumentException("subscriptionId é obrigatório");
+    if (!StringUtils.hasText(paymentMethodId)) throw new IllegalArgumentException("paymentMethodId é obrigatório");
+
+    final Subscription sub = Subscription.retrieve(subscriptionId);
+
+    String invoiceId = null;
+    try { invoiceId = sub.getLatestInvoice(); } catch (Throwable ignored) {}
+    if (!StringUtils.hasText(invoiceId)) {
+      throw new IllegalStateException("Assinatura sem fatura inicial para cobrança.");
+    }
+
+    Invoice inv = Invoice.retrieve(invoiceId);
+
+    // Paga a fatura usando o método salvo
+    log.info("[BILL][PAY] subscriptionId={}, invoiceId={}, pm={}", subscriptionId, invoiceId, paymentMethodId);
+    InvoicePayParams payParams = InvoicePayParams.builder()
+        .setPaymentMethod(paymentMethodId)
+        .build();
+    inv = inv.pay(payParams);
+
+    // Recarrega status da assinatura
+    final Subscription fresh = Subscription.retrieve(subscriptionId);
+    final SubscriptionBackendStatus status = mapStatus(fresh);
+    boolean cancelAtPeriodEnd = false;
+    try { cancelAtPeriodEnd = Boolean.TRUE.equals(fresh.getCancelAtPeriodEnd()); } catch (Throwable ignored) {}
+
+    log.info("[BILL][PAY][RES] subscriptionId={}, invoiceStatus={}, subStatus={}", subscriptionId, inv.getStatus(), status);
+    return new SubscriptionStatusResponse(subscriptionId, status, null, cancelAtPeriodEnd);
   }
 
   /** Mantém compatibilidade com o controller atual. */

@@ -13,6 +13,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
+import br.ars.payment_service.dto.ConfirmInitialPaymentRequest;
 
 @RestController
 @RequestMapping(path = "/api/billing", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -25,6 +26,17 @@ public class BillingController {
   public BillingController(BillingService billingService) {
     this.billingService = billingService;
   }
+
+ 
+
+@PostMapping(path = "/confirm-initial-payment", consumes = MediaType.APPLICATION_JSON_VALUE)
+public ResponseEntity<SubscriptionStatusResponse> confirmInitialPayment(
+    @RequestBody ConfirmInitialPaymentRequest req
+) throws StripeException {
+  SubscriptionStatusResponse res =
+      billingService.confirmInitialPayment(req.subscriptionId(), req.paymentMethodId());
+  return ResponseEntity.ok(res);
+}
 
   /** POST /api/billing/subscribe (SEM TRIAL) */
   @PostMapping(path = "/subscribe", consumes = MediaType.APPLICATION_JSON_VALUE)
