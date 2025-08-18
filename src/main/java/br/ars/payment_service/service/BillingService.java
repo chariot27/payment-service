@@ -50,7 +50,7 @@ public class BillingService {
     this.billingCustomerService = billingCustomerService;
   }
 
-  /** Fluxo único: PaymentSheet cobrando a fatura inicial (DEFAULT_INCOMPLETE). */
+  /** Cria assinatura DEFAULT_INCOMPLETE; retorna dados para PaymentSheet pagar fatura inicial. */
   @Transactional
   public SubscribeResponse startSubscription(SubscribeRequest req) throws StripeException {
     Stripe.apiKey = stripeSecretKey;
@@ -63,10 +63,8 @@ public class BillingService {
     log.info("[BILL][FLOW] startSubscription (cards/googlepay) userId={}, email={}, priceId={}, stripeVersion={}",
         userId, email, priceId, stripeVersion);
 
-    // 1) Customer
     final String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
 
-    // 2) Criar assinatura com DEFAULT_INCOMPLETE e expandir o PaymentIntent da fatura
     final SubscriptionCreateParams params = SubscriptionCreateParams.builder()
         .setCustomer(customerId)
         .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
@@ -85,12 +83,10 @@ public class BillingService {
     final Subscription subscription = Subscription.create(params);
     final String subscriptionId = subscription.getId();
 
-    // 3) Extrair client_secret do PaymentIntent (compatível com várias versões do SDK)
     String paymentIntentClientSecret = null;
 
     Invoice inv = safeGetLatestInvoice(subscription);
     if (inv == null) {
-      // fallback: recuperar invoice com expand do payment_intent
       final String invId = subscription.getLatestInvoice();
       if (StringUtils.hasText(invId)) {
         final InvoiceRetrieveParams irp = InvoiceRetrieveParams.builder()
@@ -101,7 +97,6 @@ public class BillingService {
     }
     paymentIntentClientSecret = tryExtractClientSecretFromInvoice(inv);
 
-    // 4) Ephemeral Key para o app mobile
     final EphemeralKey ek = EphemeralKey.create(
         EphemeralKeyCreateParams.builder()
             .setCustomer(customerId)
@@ -116,14 +111,14 @@ public class BillingService {
         stripePublishableKey,
         customerId,
         subscriptionId,
-        paymentIntentClientSecret, // PaymentSheet paga a fatura inicial
+        paymentIntentClientSecret,
         ek.getSecret(),
-        null, // setupIntentClientSecret (não usado neste fluxo)
-        null  // hostedInvoiceUrl (não aplicável neste fluxo)
+        null,
+        null
     );
   }
 
-  /** Confirma manualmente o PaymentIntent inicial (opcional). */
+  /** Confirma manualmente o PaymentIntent inicial (caso necessário). */
   public void confirmInitialPayment(String subscriptionId, String paymentMethodId) throws StripeException {
     Stripe.apiKey = stripeSecretKey;
 
@@ -134,7 +129,6 @@ public class BillingService {
 
     final Invoice inv = safeGetLatestInvoice(sub);
     final String piId = tryExtractPaymentIntentIdFromInvoice(inv);
-
     if (!StringUtils.hasText(piId)) {
       throw new IllegalStateException("PaymentIntent não encontrado na fatura inicial.");
     }
@@ -144,12 +138,10 @@ public class BillingService {
     if (StringUtils.hasText(paymentMethodId)) {
       b.setPaymentMethod(paymentMethodId);
     }
-
     pi.confirm(b.build());
     log.info("[BILL][CONFIRM_PI] subscriptionId={}, piId={}", subscriptionId, pi.getId());
   }
 
-  /** Mantém compatibilidade com o controller atual. */
   public SubscriptionStatusResponse getStatusAndUpsert(String subscriptionId) throws StripeException {
     return getStatus(subscriptionId);
   }
@@ -159,7 +151,7 @@ public class BillingService {
     final Subscription sub = Subscription.retrieve(subscriptionId);
     final SubscriptionBackendStatus status = mapStatus(sub);
 
-    String currentPeriodEndIso = null; // alguns jars não têm getter estável
+    String currentPeriodEndIso = null;
     boolean cancelAtPeriodEnd = false;
     try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); } catch (Throwable ignored) {}
 
@@ -187,14 +179,12 @@ public class BillingService {
     log.info("[BILL][CHANGE_PLAN] subscriptionId={}, status={}", updated.getId(), updated.getStatus());
   }
 
-  /** Para uso em webhooks (opcional). */
   public void applyWebhookUpdate(Subscription sub, Invoice inv) {
     try {
       final String subIdSafe = (sub != null) ? sub.getId() : null;
       final String invId = (inv != null) ? inv.getId() : null;
       final SubscriptionBackendStatus status = (sub != null) ? mapStatus(sub) : SubscriptionBackendStatus.INACTIVE;
       log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
-      // TODO: persistir status/datas em DB e publicar eventos internos
     } catch (Exception e) {
       log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
@@ -246,11 +236,9 @@ public class BillingService {
     return null;
   }
 
-  /** Tenta várias formas de obter o client_secret da fatura (compatível com SDKs diferentes). */
   private static String tryExtractClientSecretFromInvoice(Invoice inv) throws StripeException {
     if (inv == null) return null;
 
-    // (A) Via confirmation_secret (existente em versões novas do SDK)
     try {
       Method mCs = inv.getClass().getMethod("getConfirmationSecret");
       Object cs = mCs.invoke(inv);
@@ -261,7 +249,6 @@ public class BillingService {
       }
     } catch (Throwable ignored) {}
 
-    // (B) Via objeto PaymentIntent expandido (sem chamar diretamente getters inexistentes)
     try {
       Method mObj = inv.getClass().getMethod("getPaymentIntentObject");
       Object piObj = mObj.invoke(inv);
@@ -271,7 +258,6 @@ public class BillingService {
       }
     } catch (Throwable ignored) {}
 
-    // (C) Via id do PaymentIntent e retrieve
     try {
       Method mId = inv.getClass().getMethod("getPaymentIntent");
       Object id = mId.invoke(inv);
@@ -284,16 +270,13 @@ public class BillingService {
     return null;
   }
 
-  /** Extrai o PaymentIntent ID para confirmações manuais. */
   private static String tryExtractPaymentIntentIdFromInvoice(Invoice inv) {
     if (inv == null) return null;
-    // Primeiro tenta como id direto
     try {
       Method mId = inv.getClass().getMethod("getPaymentIntent");
       Object id = mId.invoke(inv);
       if (id instanceof String s && StringUtils.hasText(s)) return s;
     } catch (Throwable ignored) {}
-    // Depois tenta como objeto expandido
     try {
       Method mObj = inv.getClass().getMethod("getPaymentIntentObject");
       Object piObj = mObj.invoke(inv);

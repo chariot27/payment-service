@@ -1,6 +1,7 @@
 package br.ars.payment_service.controller;
 
 import br.ars.payment_service.dto.ChangePlanRequest;
+import br.ars.payment_service.dto.ConfirmPaymentRequest;
 import br.ars.payment_service.dto.SubscribeRequest;
 import br.ars.payment_service.dto.SubscribeResponse;
 import br.ars.payment_service.dto.SubscriptionStatusResponse;
@@ -11,59 +12,37 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
-import br.ars.payment_service.dto.ConfirmInitialPaymentRequest;
 
 @RestController
 @RequestMapping(path = "/api/billing", produces = MediaType.APPLICATION_JSON_VALUE)
 public class BillingController {
-
   private static final Logger log = LoggerFactory.getLogger(BillingController.class);
-
   private final BillingService billingService;
 
   public BillingController(BillingService billingService) {
     this.billingService = billingService;
   }
 
- 
-
-@PostMapping(path = "/confirm-initial-payment", consumes = MediaType.APPLICATION_JSON_VALUE)
-public ResponseEntity<SubscriptionStatusResponse> confirmInitialPayment(
-    @RequestBody ConfirmInitialPaymentRequest req
-) throws StripeException {
-  SubscriptionStatusResponse res =
-      billingService.confirmInitialPayment(req.subscriptionId(), req.paymentMethodId());
-  return ResponseEntity.ok(res);
-}
-
-  /** POST /api/billing/subscribe (SEM TRIAL) */
+  /** POST /api/billing/subscribe — cria assinatura DEFAULT_INCOMPLETE e retorna dados para PaymentSheet */
   @PostMapping(path = "/subscribe", consumes = MediaType.APPLICATION_JSON_VALUE)
   public ResponseEntity<SubscribeResponse> subscribe(@RequestBody SubscribeRequest request) throws StripeException {
-    // Service cria assinatura em DEFAULT_INCOMPLETE + expand do PaymentIntent, gera EphemeralKey e retorna client_secret.
     SubscribeResponse res = billingService.startSubscription(request);
     return ResponseEntity.ok(res);
   }
 
-  /**
-   * GET /api/billing/subscriptions/{id}
-   * Consulta status no Stripe. Se upsert=true (padrão), chama o método compat getStatusAndUpsert.
-   * Use upsert=false para apenas consultar (sem persistência).
-   */
+  /** POST /api/billing/confirm — confirmação manual do PaymentIntent (opcional) */
+  @PostMapping(path = "/confirm", consumes = MediaType.APPLICATION_JSON_VALUE)
+  public ResponseEntity<Void> confirm(@RequestBody ConfirmPaymentRequest req) throws StripeException {
+    // ATENÇÃO: o service retorna void. NÃO tente usar o retorno como SubscriptionStatusResponse.
+    billingService.confirmInitialPayment(req.subscriptionId(), req.paymentMethodId());
+    return ResponseEntity.noContent().build();
+  }
+
+  /** GET /api/billing/subscriptions/{id} — consulta status no Stripe */
   @GetMapping("/subscriptions/{id}")
-  public ResponseEntity<SubscriptionStatusResponse> getStatus(
-      @PathVariable("id") String subscriptionId,
-      @RequestParam(name = "upsert", required = false, defaultValue = "true") boolean upsert
-  ) throws StripeException {
-    if (!StringUtils.hasText(subscriptionId)) {
-      throw new IllegalArgumentException("subscriptionId é obrigatório");
-    }
-
-    SubscriptionStatusResponse res = upsert
-        ? billingService.getStatusAndUpsert(subscriptionId)
-        : billingService.getStatus(subscriptionId);
-
+  public ResponseEntity<SubscriptionStatusResponse> getStatus(@PathVariable("id") String subscriptionId) throws StripeException {
+    SubscriptionStatusResponse res = billingService.getStatusAndUpsert(subscriptionId);
     return ResponseEntity.ok(res);
   }
 
