@@ -64,8 +64,10 @@ public class BillingService {
     log.info("[BILL][FLOW] startSubscription (cards/googlepay) userId={}, email={}, priceId={}, stripeVersion={}",
         userId, email, priceId, stripeVersion);
 
+    // 1) Customer
     final String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
 
+    // 2) Cria assinatura: DEFAULT_INCOMPLETE + salvar PM na assinatura
     final SubscriptionCreateParams params = SubscriptionCreateParams.builder()
         .setCustomer(customerId)
         .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
@@ -78,19 +80,28 @@ public class BillingService {
                 )
                 .build()
         )
-        // Precisamos de ambos: PI (quando há cobrança inicial) e SI (quando não há cobrança inicial / trial)
+        // expansões iniciais (alguns jars ignoram nested aqui; por isso haverá um retrieve depois)
+        .addExpand("latest_invoice")
         .addExpand("latest_invoice.payment_intent")
         .addExpand("pending_setup_intent")
         .build();
 
-    final Subscription subscription = Subscription.create(params);
-    final String subscriptionId = subscription.getId();
+    final Subscription subCreated = Subscription.create(params);
+    final String subscriptionId = subCreated.getId();
 
-    // 1) tenta PaymentIntent da fatura inicial
+    // 3) Segundo retrieve COM as expansões corretas (garante objetos populados)
+    final SubscriptionRetrieveParams srp = SubscriptionRetrieveParams.builder()
+        .addExpand("latest_invoice")
+        .addExpand("latest_invoice.payment_intent")
+        .addExpand("pending_setup_intent")
+        .build();
+    final Subscription sub = Subscription.retrieve(subscriptionId, srp, (RequestOptions) null);
+
+    // 4) Tenta extrair PI client_secret da fatura inicial
     String paymentIntentClientSecret = null;
-    Invoice inv = safeGetLatestInvoice(subscription);
+    Invoice inv = safeGetLatestInvoice(sub);
     if (inv == null) {
-      final String invId = subscription.getLatestInvoice();
+      final String invId = sub.getLatestInvoice();
       if (StringUtils.hasText(invId)) {
         final InvoiceRetrieveParams irp = InvoiceRetrieveParams.builder()
             .addExpand("payment_intent")
@@ -100,13 +111,15 @@ public class BillingService {
     }
     paymentIntentClientSecret = tryExtractClientSecretFromInvoice(inv);
 
-    // 2) se não houver PI, tenta SetupIntent pendente da assinatura
+    // 5) Se não houver PI, tenta SetupIntent pendente da assinatura
     String setupIntentClientSecret = null;
+    String siIdForLog = null;
     if (!StringUtils.hasText(paymentIntentClientSecret)) {
-      setupIntentClientSecret = tryExtractSetupIntentClientSecret(subscription);
+      setupIntentClientSecret = tryExtractSetupIntentClientSecret(sub);
+      siIdForLog = tryGetPendingSetupIntentId(sub);
     }
 
-    // 3) cria EphemeralKey para o app
+    // 6) Ephemeral Key para o app
     final EphemeralKey ek = EphemeralKey.create(
         EphemeralKeyCreateParams.builder()
             .setCustomer(customerId)
@@ -114,8 +127,9 @@ public class BillingService {
             .build()
     );
 
-    log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}, hasSI={}",
-        subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null);
+    final String invIdForLog = (inv != null ? inv.getId() : null);
+    log.info("[BILL][FLOW][RES] subId={}, customerId={}, invId={}, hasPI={}, siId={}, hasSI={}",
+        subscriptionId, customerId, invIdForLog, paymentIntentClientSecret != null, siIdForLog, setupIntentClientSecret != null);
 
     return new SubscribeResponse(
         stripePublishableKey,
@@ -128,11 +142,12 @@ public class BillingService {
     );
   }
 
-  /** Confirma manualmente o PaymentIntent inicial (opcional). */
+  /** Confirma manualmente o PaymentIntent inicial (opcional para PI; não usado para SI). */
   public void confirmInitialPayment(String subscriptionId, String paymentMethodId) throws StripeException {
     Stripe.apiKey = stripeSecretKey;
 
     final SubscriptionRetrieveParams srp = SubscriptionRetrieveParams.builder()
+        .addExpand("latest_invoice")
         .addExpand("latest_invoice.payment_intent")
         .build();
     final Subscription sub = Subscription.retrieve(subscriptionId, srp, (RequestOptions) null);
@@ -152,6 +167,7 @@ public class BillingService {
     log.info("[BILL][CONFIRM_PI] subscriptionId={}, piId={}", subscriptionId, pi.getId());
   }
 
+  /** Mantém compatibilidade com o controller atual. */
   public SubscriptionStatusResponse getStatusAndUpsert(String subscriptionId) throws StripeException {
     return getStatus(subscriptionId);
   }
@@ -189,13 +205,14 @@ public class BillingService {
     log.info("[BILL][CHANGE_PLAN] subscriptionId={}, status={}", updated.getId(), updated.getStatus());
   }
 
+  /** Usado pelo StripeWebhookController */
   public void applyWebhookUpdate(Subscription sub, Invoice inv) {
     try {
       final String subIdSafe = (sub != null) ? sub.getId() : null;
       final String invId = (inv != null) ? inv.getId() : null;
       final SubscriptionBackendStatus status = (sub != null) ? mapStatus(sub) : SubscriptionBackendStatus.INACTIVE;
       log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
-      // TODO: persistir em DB, se necessário
+      // TODO: persistir status/datas em DB e publicar eventos internos
     } catch (Exception e) {
       log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
@@ -271,7 +288,7 @@ public class BillingService {
       }
     } catch (Throwable ignored) {}
 
-    // 3) payment_intent como id e faz retrieve
+    // 3) payment_intent como id + retrieve
     try {
       Method mId = inv.getClass().getMethod("getPaymentIntent");
       Object id = mId.invoke(inv);
@@ -324,6 +341,21 @@ public class BillingService {
       }
     } catch (Throwable ignored) {}
 
+    return null;
+  }
+
+  private static String tryGetPendingSetupIntentId(Subscription sub) {
+    if (sub == null) return null;
+    try {
+      Method mId = sub.getClass().getMethod("getPendingSetupIntent");
+      Object id = mId.invoke(sub);
+      if (id instanceof String s && StringUtils.hasText(s)) return s;
+    } catch (Throwable ignored) {}
+    try {
+      Method mObj = sub.getClass().getMethod("getPendingSetupIntentObject");
+      Object siObj = mObj.invoke(sub);
+      if (siObj instanceof SetupIntent si) return si.getId();
+    } catch (Throwable ignored) {}
     return null;
   }
 }
