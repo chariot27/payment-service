@@ -35,7 +35,7 @@ public class StripeWebhookController {
   @Value("${app.stripe.webhook-secret:${app.stripe.webhook.secret:}}")
   private String webhookSecret;
 
-  // Usado para enriquecer dados (retrieve de Subscription/Invoice) quando necessário
+  // Usado para enriquecer dados (retrieve) quando necessário
   @Value("${app.stripe.secret-key:}")
   private String stripeSecretKey;
 
@@ -72,21 +72,18 @@ public class StripeWebhookController {
       log.info("[STRIPE][WEBHOOK] {} | eventId={}", type, event.getId());
 
       switch (type) {
-        // Paga a fatura inicial da assinatura (ou falha). É o gatilho mais confiável pra “virar” ACTIVE/TRIALING.
         case "invoice.payment_succeeded":
         case "invoice.payment_failed": {
           String subscriptionId = null;
           String invoiceId = null;
 
-          // 1) Tente extrair via JSON cru (robusto a mudanças de SDK)
+          // 1) Extrai ids de forma robusta (compatível com variações do SDK)
           try {
             JsonObject root = JsonParser.parseString(payload).getAsJsonObject();
             JsonObject obj = root.getAsJsonObject("data").getAsJsonObject("object");
-
             if (obj.has("id") && obj.get("id").isJsonPrimitive()) {
               invoiceId = obj.get("id").getAsString();
             }
-
             if (obj.has("subscription")) {
               JsonElement subEl = obj.get("subscription");
               if (subEl.isJsonPrimitive()) {
@@ -99,10 +96,9 @@ public class StripeWebhookController {
             log.warn("[STRIPE][WEBHOOK] falha ao parsear payload JSON: {}", t.getMessage());
           }
 
-          // 2) Se possível, enriqueça com retrieve (útil para current_period_end, cancelAtPeriodEnd etc.)
+          // 2) Enriquecimento via retrieve (opcional, mas recomendado)
           Subscription sub = null;
           Invoice inv = null;
-
           if (stripeSecretKey != null && !stripeSecretKey.isBlank()) {
             Stripe.apiKey = stripeSecretKey;
             try {
@@ -112,10 +108,8 @@ public class StripeWebhookController {
             } catch (StripeException e) {
               log.warn("[WEBHOOK] retrieve invoice err: {}", e.getMessage());
             }
-
             try {
               if (subscriptionId != null && !subscriptionId.isBlank()) {
-                // Expand para ter PI da invoice atual e evitar roundtrips se o service precisar
                 java.util.Map<String, Object> params = new java.util.HashMap<>();
                 params.put("expand", java.util.List.of("latest_invoice.payment_intent"));
                 sub = Subscription.retrieve(subscriptionId, params, null);
@@ -127,27 +121,23 @@ public class StripeWebhookController {
             log.warn("[STRIPE][WEBHOOK] app.stripe.secret-key não configurada; seguindo sem retrieve.");
           }
 
-          // 3) Delegue ao service (ele persiste ACTIVE/TRIALING/CANCELED etc.)
+          // 3) Persiste o novo estado (ACTIVE/TRIALING/etc.)
           billingService.applyWebhookUpdate(sub, inv);
           break;
         }
 
-        // Mudanças de status da assinatura (created/updated/deleted)
         case "customer.subscription.created":
         case "customer.subscription.updated":
         case "customer.subscription.deleted": {
           Subscription sub = null;
-
-          // Priorize o objeto desserializado pelo SDK (se disponível)
           if (des.getObject().isPresent() && des.getObject().get() instanceof Subscription s) {
             sub = s;
           } else {
-            // Fallback minimalista: tente extrair o subscriptionId do payload cru e dar retrieve
+            // Fallback: tenta recuperar via id cru do payload
             try {
               JsonObject root = JsonParser.parseString(payload).getAsJsonObject();
               JsonObject obj = root.getAsJsonObject("data").getAsJsonObject("object");
               String subscriptionId = obj.has("id") ? obj.get("id").getAsString() : null;
-
               if (stripeSecretKey != null && subscriptionId != null && !subscriptionId.isBlank()) {
                 Stripe.apiKey = stripeSecretKey;
                 java.util.Map<String, Object> params = new java.util.HashMap<>();
@@ -158,23 +148,19 @@ public class StripeWebhookController {
               log.warn("[WEBHOOK] fallback retrieve sub err: {}", ex.getMessage());
             }
           }
-
           billingService.applyWebhookUpdate(sub, null);
           break;
         }
 
-        // Opcional: outros eventos (ex.: payment_intent.succeeded) podem ser usados como “redundância”
         default:
           log.debug("[STRIPE][WEBHOOK] evento ignorado: {}", type);
           break;
       }
     } catch (Exception e) {
       log.error("[STRIPE][WEBHOOK][ERR] {}", e.getMessage(), e);
-      // 500 força retry pela Stripe (bom quando a persistência falha e você quer nova tentativa)
       return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("error");
     }
 
-    // 200 = recebido com sucesso
     return ResponseEntity.ok("ok");
   }
 }
