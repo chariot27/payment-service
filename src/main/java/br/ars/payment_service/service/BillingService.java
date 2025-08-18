@@ -8,6 +8,7 @@ import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
 import com.stripe.model.EphemeralKey;
 import com.stripe.model.Invoice;
+import com.stripe.model.PaymentIntent;
 import com.stripe.model.Subscription;
 import com.stripe.param.EphemeralKeyCreateParams;
 import com.stripe.param.SubscriptionCreateParams;
@@ -18,6 +19,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
+
+import java.lang.reflect.Method;
 
 @Service
 public class BillingService {
@@ -72,13 +75,16 @@ public class BillingService {
                 )
                 .build()
         )
+        // >>> IMPORTANTE: expandir o PI ligado à fatura
         .addExpand("latest_invoice")
+        .addExpand("latest_invoice.payment_intent")
+        // <<<
         .build();
 
     final Subscription subscription = Subscription.create(params);
     final String subscriptionId = subscription.getId();
 
-    // 3) Extrair client secret via confirmation_secret (sem depender de PaymentIntent getters)
+    // 3) Extrair client secret (várias estratégias compatíveis com versões do stripe-java)
     String paymentIntentClientSecret = null;
 
     Invoice inv = null;
@@ -93,12 +99,42 @@ public class BillingService {
     }
 
     if (inv != null) {
+      // 3.1) Tenta confirmation_secret (se o campo existir para sua versão de API/conta)
       try {
         Invoice.ConfirmationSecret cs = inv.getConfirmationSecret();
         if (cs != null && StringUtils.hasText(cs.getClientSecret())) {
           paymentIntentClientSecret = cs.getClientSecret();
         }
       } catch (Throwable ignored) {}
+
+      // 3.2) Fallback: tentar inv.getPaymentIntentObject().getClientSecret() via reflection
+      if (paymentIntentClientSecret == null) {
+        try {
+          Object piObj = tryInvokeNoArgs(inv, "getPaymentIntentObject");
+          if (piObj instanceof PaymentIntent) {
+            String cs = ((PaymentIntent) piObj).getClientSecret();
+            if (StringUtils.hasText(cs)) {
+              paymentIntentClientSecret = cs;
+            }
+          }
+        } catch (Throwable ignored) {}
+      }
+
+      // 3.3) Fallback final: tentar inv.getPaymentIntent() (id) -> PaymentIntent.retrieve(id)
+      if (paymentIntentClientSecret == null) {
+        try {
+          Object idObj = tryInvokeNoArgs(inv, "getPaymentIntent");
+          if (idObj instanceof String) {
+            String piId = (String) idObj;
+            if (StringUtils.hasText(piId)) {
+              PaymentIntent pi = PaymentIntent.retrieve(piId);
+              if (pi != null && StringUtils.hasText(pi.getClientSecret())) {
+                paymentIntentClientSecret = pi.getClientSecret();
+              }
+            }
+          }
+        } catch (Throwable ignored) {}
+      }
     }
 
     // 4) Ephemeral Key (no servidor) para o app mobile
@@ -206,5 +242,17 @@ public class BillingService {
       case "always_invoice" -> SubscriptionUpdateParams.ProrationBehavior.ALWAYS_INVOICE;
       default -> null;
     };
+  }
+
+  /** Reflection “safe”: chama método sem argumentos, se existir. */
+  private static Object tryInvokeNoArgs(Object target, String method) {
+    if (target == null) return null;
+    try {
+      Method m = target.getClass().getMethod(method);
+      m.setAccessible(true);
+      return m.invoke(target);
+    } catch (Throwable ignored) {
+      return null;
+    }
   }
 }
