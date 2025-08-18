@@ -8,7 +8,6 @@ import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
 import com.stripe.model.EphemeralKey;
 import com.stripe.model.Invoice;
-import com.stripe.model.PaymentIntent;
 import com.stripe.model.Subscription;
 import com.stripe.param.EphemeralKeyCreateParams;
 import com.stripe.param.SubscriptionCreateParams;
@@ -76,21 +75,21 @@ public class BillingService {
                 .build()
         )
         .addExpand("latest_invoice")
-        .addExpand("latest_invoice.payment_intent")
+        // A expansão do PI não é mais necessária para obter o client_secret;
+        // vamos usar Invoice.confirmation_secret (caminho suportado/estável).
         .build();
 
     final Subscription subscription = Subscription.create(params);
     final String subscriptionId = subscription.getId();
 
-    // 3) Extrair client secret para o PaymentSheet
+    // 3) Extrair client secret para o PaymentSheet via confirmation_secret (29.4.0+)
     String paymentIntentClientSecret = null;
 
-    // latest_invoice (expandida ou via retrieve)
     Invoice inv = null;
     try { inv = subscription.getLatestInvoiceObject(); } catch (Throwable ignored) {}
     if (inv == null) {
       try {
-        final String invId = subscription.getLatestInvoice();
+        String invId = subscription.getLatestInvoice();
         if (StringUtils.hasText(invId)) {
           inv = Invoice.retrieve(invId);
         }
@@ -98,34 +97,12 @@ public class BillingService {
     }
 
     if (inv != null) {
-      // Preferível (SDK stripe-java 29.4.0+): usar confirmation_secret
       try {
         Invoice.ConfirmationSecret cs = inv.getConfirmationSecret();
         if (cs != null && StringUtils.hasText(cs.getClientSecret())) {
           paymentIntentClientSecret = cs.getClientSecret();
         }
       } catch (Throwable ignored) {}
-
-      // 2º fallback: se o PaymentIntent tiver sido expandido
-      if (paymentIntentClientSecret == null) {
-        try {
-          PaymentIntent pi = inv.getPaymentIntentObject(); // requer 29.4.0+ e expand
-          if (pi != null && StringUtils.hasText(pi.getClientSecret())) {
-            paymentIntentClientSecret = pi.getClientSecret();
-          }
-        } catch (Throwable ignored) {}
-      }
-
-      // 3º fallback: buscar o PaymentIntent por id e pegar o client secret
-      if (paymentIntentClientSecret == null) {
-        try {
-          String piId = inv.getPaymentIntent(); // id do PI
-          if (StringUtils.hasText(piId)) {
-            PaymentIntent pi = PaymentIntent.retrieve(piId);
-            paymentIntentClientSecret = pi.getClientSecret();
-          }
-        } catch (Throwable ignored) {}
-      }
     }
 
     // 4) Ephemeral Key (criado NO SERVIDOR) para o app mobile
@@ -150,9 +127,9 @@ public class BillingService {
     );
   }
 
-  /** Usado pelo controller atual (compat): consulta e opcionalmente persiste. */
+  /** Compatível com o controller atual: consulta e (se quiser) persiste localmente. */
   public SubscriptionStatusResponse getStatusAndUpsert(String subscriptionId) throws StripeException {
-    // Aqui você pode persistir em DB e publicar eventos internos se quiser.
+    // Aqui você pode fazer upsert em DB/eventos internos se necessário.
     return getStatus(subscriptionId);
   }
 
@@ -166,9 +143,7 @@ public class BillingService {
     try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); } catch (Throwable ignored) {}
     try {
       Long ts = sub.getCurrentPeriodEnd(); // epoch seconds
-      if (ts != null && ts > 0) {
-        currentPeriodEndIso = Instant.ofEpochSecond(ts).toString();
-      }
+      if (ts != null && ts > 0) currentPeriodEndIso = Instant.ofEpochSecond(ts).toString();
     } catch (Throwable ignored) {}
 
     return new SubscriptionStatusResponse(subscriptionId, status, currentPeriodEndIso, cancelAtPeriodEnd);
