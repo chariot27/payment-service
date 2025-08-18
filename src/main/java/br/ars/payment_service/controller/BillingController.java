@@ -13,20 +13,9 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-/**
- * Controlador REST de billing/assinaturas.
- *
- * Convenções importantes para “virar” ATIVA/TRIALING:
- * - startSubscription deve criar a assinatura com payment_behavior=default_incomplete (quando cobrar agora),
- *   expandindo latest_invoice.payment_intent e retornando paymentIntentClientSecret.
- * - O app confirma via PaymentSheet.
- * - O webhook (acima) persiste a transição de status (invoice.payment_succeeded / customer.subscription.updated).
- * - getStatus pode ler direto do Stripe ou do cache/banco que o webhook atualiza.
- */
 @RestController
 @RequestMapping(path = "/api/billing", produces = MediaType.APPLICATION_JSON_VALUE)
 public class BillingController {
-
   private static final Logger log = LoggerFactory.getLogger(BillingController.class);
 
   private final BillingService billingService;
@@ -35,36 +24,31 @@ public class BillingController {
     this.billingService = billingService;
   }
 
-  /** Inicia a assinatura e devolve os segredos para a PaymentSheet (PI ou SI, conforme o fluxo). */
+  /** POST /api/billing/subscribe (SEM TRIAL) */
   @PostMapping(path = "/subscribe", consumes = MediaType.APPLICATION_JSON_VALUE)
   public ResponseEntity<SubscribeResponse> subscribe(@RequestBody SubscribeRequest request) throws StripeException {
-    // O service deve:
-    // - Garantir o customer (por userId/email)
-    // - Criar a assinatura usando DEFAULT_INCOMPLETE + expand=latest_invoice.payment_intent (ou SetupIntent para trial)
-    // - Gerar EphemeralKey (respeitando Stripe-Version do mobile, se aplicável)
-    // - Retornar: subscriptionId, customerId, ephemeralKeySecret, paymentIntentClientSecret OU setupIntentClientSecret, publishableKey
+    // Service cria assinatura com DEFAULT_INCOMPLETE + expand PI, gera EphemeralKey e retorna client_secret do PI.
     SubscribeResponse res = billingService.startSubscription(request);
     return ResponseEntity.ok(res);
   }
 
-  /** Consulta status atual da assinatura (ACTIVE/TRIALING/INCOMPLETE/PAST_DUE/etc). */
+  /** GET /api/billing/subscriptions/{id} — consulta Stripe e (opcional) upsert local */
   @GetMapping("/subscriptions/{id}")
   public ResponseEntity<SubscriptionStatusResponse> getStatus(@PathVariable("id") String subscriptionId) throws StripeException {
-    // O service pode:
-    // - Ler do Stripe (fonte da verdade) e mapear para seu enum
-    // - OU ler do seu banco (que o webhook mantém em sincronia) — recomendável ter ambos e preferir Stripe quando preciso
-    SubscriptionStatusResponse res = billingService.getStatus(subscriptionId);
+    // Importante: implemente no service uma leitura direta no Stripe (fonte da verdade)
+    // e faça upsert no banco para “destravamento” imediato, mesmo sem o webhook ter chegado ainda.
+    SubscriptionStatusResponse res = billingService.getStatusAndUpsert(subscriptionId);
     return ResponseEntity.ok(res);
   }
 
-  /** Troca o plano (price) de uma assinatura, com proration configurável. */
+  /** Troca de plano */
   @PostMapping(path = "/change-plan", consumes = MediaType.APPLICATION_JSON_VALUE)
   public ResponseEntity<Void> changePlan(@RequestBody ChangePlanRequest req) throws StripeException {
     billingService.changePlan(req.subscriptionId(), req.newPriceId(), req.prorationBehavior());
     return ResponseEntity.noContent().build();
   }
 
-  /* -------------------- Handlers uniformes de erro -------------------- */
+  /* ---- Handlers uniformes ---- */
 
   @ExceptionHandler(IllegalArgumentException.class)
   public ResponseEntity<ErrorBody> onBadRequest(IllegalArgumentException ex) {
