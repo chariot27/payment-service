@@ -35,7 +35,7 @@ public class StripeWebhookController {
   @Value("${app.stripe.webhook-secret:${app.stripe.webhook.secret:}}")
   private String webhookSecret;
 
-  // Usado para enriquecer dados (retrieve) quando necessário
+  // (opcional) também com default para não quebrar se faltar
   @Value("${app.stripe.secret-key:}")
   private String stripeSecretKey;
 
@@ -48,8 +48,10 @@ public class StripeWebhookController {
       @RequestHeader(name = "Stripe-Signature", required = false) String signature,
       @RequestBody String payload
   ) {
+    // Se o secret não estiver configurado, não derruba a aplicação no deploy;
+    // apenas rejeita a chamada e loga.
     if (webhookSecret == null || webhookSecret.isBlank()) {
-      log.error("[STRIPE][WEBHOOK] webhook secret ausente (app.stripe.webhook-secret). Configure STRIPE_WEBHOOK_SECRET.");
+      log.error("[STRIPE][WEBHOOK] webhook secret ausente (app.stripe.webhook-secret). Configure a env STRIPE_WEBHOOK_SECRET.");
       return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("webhook secret not configured");
     }
     if (signature == null || signature.isBlank()) {
@@ -69,21 +71,23 @@ public class StripeWebhookController {
       final String type = event.getType();
       final EventDataObjectDeserializer des = event.getDataObjectDeserializer();
 
-      log.info("[STRIPE][WEBHOOK] {} | eventId={}", type, event.getId());
-
       switch (type) {
         case "invoice.payment_succeeded":
         case "invoice.payment_failed": {
+          // SDK 29.x pode não expor getSubscription() diretamente em Invoice -> usa JSON cru
           String subscriptionId = null;
           String invoiceId = null;
 
-          // 1) Extrai ids de forma robusta (compatível com variações do SDK)
           try {
             JsonObject root = JsonParser.parseString(payload).getAsJsonObject();
             JsonObject obj = root.getAsJsonObject("data").getAsJsonObject("object");
+
+            // invoice.id
             if (obj.has("id") && obj.get("id").isJsonPrimitive()) {
               invoiceId = obj.get("id").getAsString();
             }
+
+            // invoice.subscription pode vir como string OU objeto
             if (obj.has("subscription")) {
               JsonElement subEl = obj.get("subscription");
               if (subEl.isJsonPrimitive()) {
@@ -96,11 +100,21 @@ public class StripeWebhookController {
             log.warn("[STRIPE][WEBHOOK] falha ao parsear payload JSON: {}", t.getMessage());
           }
 
-          // 2) Enriquecimento via retrieve (opcional, mas recomendado)
+          // Opcional: recuperar via API para enriquecer o update
           Subscription sub = null;
           Invoice inv = null;
+
           if (stripeSecretKey != null && !stripeSecretKey.isBlank()) {
             Stripe.apiKey = stripeSecretKey;
+
+            try {
+              if (subscriptionId != null && !subscriptionId.isBlank()) {
+                sub = Subscription.retrieve(subscriptionId);
+              }
+            } catch (StripeException e) {
+              log.warn("[WEBHOOK] retrieve subscription err: {}", e.getMessage());
+            }
+
             try {
               if (invoiceId != null && !invoiceId.isBlank()) {
                 inv = Invoice.retrieve(invoiceId);
@@ -108,56 +122,30 @@ public class StripeWebhookController {
             } catch (StripeException e) {
               log.warn("[WEBHOOK] retrieve invoice err: {}", e.getMessage());
             }
-            try {
-              if (subscriptionId != null && !subscriptionId.isBlank()) {
-                java.util.Map<String, Object> params = new java.util.HashMap<>();
-                params.put("expand", java.util.List.of("latest_invoice.payment_intent"));
-                sub = Subscription.retrieve(subscriptionId, params, null);
-              }
-            } catch (StripeException e) {
-              log.warn("[WEBHOOK] retrieve subscription err: {}", e.getMessage());
-            }
           } else {
             log.warn("[STRIPE][WEBHOOK] app.stripe.secret-key não configurada; seguindo sem retrieve.");
           }
 
-          // 3) Persiste o novo estado (ACTIVE/TRIALING/etc.)
           billingService.applyWebhookUpdate(sub, inv);
           break;
         }
 
-        case "customer.subscription.created":
         case "customer.subscription.updated":
         case "customer.subscription.deleted": {
-          Subscription sub = null;
-          if (des.getObject().isPresent() && des.getObject().get() instanceof Subscription s) {
-            sub = s;
-          } else {
-            // Fallback: tenta recuperar via id cru do payload
-            try {
-              JsonObject root = JsonParser.parseString(payload).getAsJsonObject();
-              JsonObject obj = root.getAsJsonObject("data").getAsJsonObject("object");
-              String subscriptionId = obj.has("id") ? obj.get("id").getAsString() : null;
-              if (stripeSecretKey != null && subscriptionId != null && !subscriptionId.isBlank()) {
-                Stripe.apiKey = stripeSecretKey;
-                java.util.Map<String, Object> params = new java.util.HashMap<>();
-                params.put("expand", java.util.List.of("latest_invoice.payment_intent"));
-                sub = Subscription.retrieve(subscriptionId, params, null);
-              }
-            } catch (Exception ex) {
-              log.warn("[WEBHOOK] fallback retrieve sub err: {}", ex.getMessage());
-            }
-          }
+          Object obj = des.getObject().orElse(null);
+          Subscription sub = (obj instanceof Subscription) ? (Subscription) obj : null;
           billingService.applyWebhookUpdate(sub, null);
           break;
         }
 
         default:
+          // outros eventos podem ser ignorados por enquanto
           log.debug("[STRIPE][WEBHOOK] evento ignorado: {}", type);
           break;
       }
     } catch (Exception e) {
       log.error("[STRIPE][WEBHOOK][ERR] {}", e.getMessage(), e);
+      // 500 faz a Stripe re-tentar; se preferir não re-tentar, devolva 200 "ok"
       return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("error");
     }
 

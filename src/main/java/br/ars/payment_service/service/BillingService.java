@@ -1,437 +1,357 @@
 package br.ars.payment_service.service;
 
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import br.ars.payment_service.dto.SubscribeRequest;
+import br.ars.payment_service.dto.SubscribeResponse;
+import br.ars.payment_service.dto.SubscriptionBackendStatus;
+import br.ars.payment_service.dto.SubscriptionStatusResponse;
+import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
+import com.stripe.model.EphemeralKey;
 import com.stripe.model.Invoice;
 import com.stripe.model.PaymentIntent;
+import com.stripe.model.SetupIntent;
 import com.stripe.model.Subscription;
-import com.stripe.param.InvoiceRetrieveParams;
-import com.stripe.param.SubscriptionRetrieveParams;
+import com.stripe.param.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.util.Arrays;
 
 @Service
 public class BillingService {
 
-    private static final Logger log = LoggerFactory.getLogger(BillingService.class);
+  private static final Logger log = LoggerFactory.getLogger(BillingService.class);
 
-    // =====================================================================
-    // >>> OUTROS CAMPOS/INJEÇÕES/MÉTODOS DO SEU SERVIÇO PERMANECEM IGUAIS <<
-    // =====================================================================
+  @Value("${app.stripe.secret-key}")
+  private String stripeSecretKey;
 
-    // ---------------------------------------------------------------------
-    // START: ajuste de UMA linha dentro do seu startSubscription(...)
-    // Procure pela linha que chamava "fetchPIClientSecretBlocking(sub, Duration.ofSeconds(30))"
-    // e troque por ESTA VERSÃO (passando customerId e timeout 45s):
-    //
-    // String piClientSecret = fetchPIClientSecretBlocking(subscription, customerId, Duration.ofSeconds(45));
-    //
-    // ---------------------------------------------------------------------
+  @Value("${app.stripe.publishable-key}")
+  private String stripePublishableKey;
 
-    /**
-     * Faz polling para obter o client_secret do PaymentIntent associado à assinatura.
-     * Suporta diferenças entre versões do SDK da Stripe:
-     * - Quando a expansão retorna apenas o ID do PI (string)
-     * - Quando retorna o objeto do PI, porém sem lastResponse/JSON
-     * - Quando é necessário reconsultar (retrieve) o PI para obter o client_secret
-     * Inclui fallback por listagem de PIs do cliente para casar pela invoice.
-     */
-    private String fetchPIClientSecretBlocking(Subscription initial, String customerId, Duration maxWait) throws StripeException {
-        final long deadline = System.nanoTime() + maxWait.toNanos();
-        int attempt = 0;
-        Subscription sub = initial;
+  @Value("${app.stripe.prices.basic}")
+  private String defaultBasicPriceId;
 
-        while (System.nanoTime() < deadline) {
-            attempt++;
+  /** Versão da API usada pelo app móvel ao criar EphemeralKey (ex.: 2020-08-27) */
+  @Value("${app.stripe.mobile-api-version:2020-08-27}")
+  private String mobileApiVersionDefault;
 
-            try {
-                // (A) Retrieve da assinatura com expands
-                sub = Subscription.retrieve(
-                    sub.getId(),
-                    SubscriptionRetrieveParams.builder()
-                        .addExpand("latest_invoice")
-                        .addExpand("latest_invoice.payment_intent")
-                        .build(),
-                    null
-                );
+  private final BillingCustomerService billingCustomerService;
 
-                String latestInvoiceId = null;
-                try { latestInvoiceId = sub.getLatestInvoice(); } catch (Throwable ignore) {}
+  public BillingService(BillingCustomerService billingCustomerService) {
+    this.billingCustomerService = billingCustomerService;
+  }
 
-                Invoice inv = null;
-                try { inv = sub.getLatestInvoiceObject(); } catch (Throwable ignore) {}
+  /** Fluxo: tenta PI da latest_invoice; se não houver, fallback para SetupIntent("card"). */
+  @Transactional
+  public SubscribeResponse startSubscription(SubscribeRequest req) throws StripeException {
+    Stripe.apiKey = stripeSecretKey;
 
-                // 1) Tenta extrair o ID do PI a partir da invoice (compatível com SDKs diferentes)
-                String piId = tryGetPaymentIntentId(inv);
-                if (piId != null) {
-                    // Re-retrieve garante objeto "fresh" com lastResponse e client_secret
-                    PaymentIntent pi = PaymentIntent.retrieve(piId);
-                    String cs = tryExtractClientSecret(pi);
-                    if (hasText(cs)) {
-                        log.info("[BILL][PI] CS via PI.retrieve (tentativa {}): pi={}", attempt, piId);
-                        return cs;
-                    }
-                }
+    final String userId = require(req.userId(), "userId");
+    final String email = req.email();
+    final String priceId = StringUtils.hasText(req.priceId()) ? req.priceId() : defaultBasicPriceId;
+    final String stripeVersion = StringUtils.hasText(req.stripeVersion()) ? req.stripeVersion() : mobileApiVersionDefault;
 
-                // 2) Tenta pelo JSON cru da Invoice (quando existe lastResponse no expand)
-                if (inv != null) {
-                    String cs = tryExtractClientSecretFromInvoiceRaw(inv);
-                    if (hasText(cs)) {
-                        log.info("[BILL][PI] CS via Invoice RAW (tentativa {}) inv={}", attempt, inv.getId());
-                        return cs;
-                    }
-                } else {
-                    // 3) Como último recurso, tenta pelo JSON cru da Subscription
-                    String cs = tryExtractClientSecretFromSubscriptionRaw(sub);
-                    if (hasText(cs)) {
-                        log.info("[BILL][PI] CS via Subscription RAW (tentativa {}) sub={}", attempt, sub.getId());
-                        return cs;
-                    }
-                }
+    log.info("[BILL][FLOW] startSubscription (GPay) userId={}, email={}, priceId={}, stripeVersion={}",
+        userId, email, priceId, stripeVersion);
 
-                // (B) Retrieve direto da invoice + expand payment_intent e então retrieve do PI
-                if (hasText(latestInvoiceId)) {
-                    Invoice inv2 = Invoice.retrieve(
-                        latestInvoiceId,
-                        InvoiceRetrieveParams.builder().addExpand("payment_intent").build(),
-                        null
-                    );
+    // 1) Customer por usuário
+    final String customerId = billingCustomerService.findOrCreateCustomer(userId, email);
 
-                    String piId2 = tryGetPaymentIntentId(inv2);
-                    if (piId2 != null) {
-                        PaymentIntent pi2 = PaymentIntent.retrieve(piId2);
-                        String cs = tryExtractClientSecret(pi2);
-                        if (hasText(cs)) {
-                            log.info("[BILL][PI] CS via Invoice.retrieve→PI.retrieve (tentativa {}) pi={}", attempt, piId2);
-                            return cs;
-                        }
-                    }
+    // 2) Criar assinatura DEFAULT_INCOMPLETE para gerar PaymentIntent na fatura
+    final SubscriptionCreateParams.PaymentSettings.Builder ps =
+        SubscriptionCreateParams.PaymentSettings.builder()
+            .setSaveDefaultPaymentMethod(
+                SubscriptionCreateParams.PaymentSettings.SaveDefaultPaymentMethod.ON_SUBSCRIPTION
+            );
 
-                    String cs = tryExtractClientSecretFromInvoiceRaw(inv2);
-                    if (hasText(cs)) {
-                        log.info("[BILL][PI] CS via Invoice.retrieve RAW (tentativa {}) inv={}", attempt, inv2.getId());
-                        return cs;
-                    }
-                }
+    // GPay requer 'card' habilitado na conta; mantemos isso aqui.
+    ps.putExtraParam("payment_method_types", Arrays.asList("card"));
 
-                // (C) Fallback por listagem de PIs do cliente e casamento pela invoice
-                if (hasText(customerId)) {
-                    try {
-                        String cs = findClientSecretByListingPIs(customerId, sub.getLatestInvoice());
-                        if (hasText(cs)) {
-                            log.info("[BILL][PI] CS via PaymentIntent.list (tentativa {})", attempt);
-                            return cs;
-                        }
-                    } catch (Throwable t) {
-                        log.debug("[BILL][PI] list fallback falhou: {}", t.getMessage());
-                    }
-                }
-            } catch (Throwable t) {
-                log.debug("[BILL][PI] tentativa {} falhou: {}", attempt, t.toString());
-            }
+    final SubscriptionCreateParams params = SubscriptionCreateParams.builder()
+        .setCustomer(customerId)
+        .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
+        .setCollectionMethod(SubscriptionCreateParams.CollectionMethod.CHARGE_AUTOMATICALLY)
+        .setPaymentBehavior(SubscriptionCreateParams.PaymentBehavior.DEFAULT_INCOMPLETE)
+        .setPaymentSettings(ps.build())
+        .addExpand("latest_invoice")
+        .addExpand("latest_invoice.payment_intent")
+        .build();
 
-            // backoff progressivo (até 2s)
-            long backoffMs = Math.min(2000L, 250L * attempt);
-            try { Thread.sleep(backoffMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-        }
+    final Subscription subscription = Subscription.create(params);
+    final String subscriptionId = subscription.getId();
 
-        log.warn("[BILL][PI-RETRY] Timeout sem obter client_secret para sub {}", initial.getId());
-        return null;
+    // 3) Obter o client_secret do PaymentIntent (com retries curtos)
+    String paymentIntentClientSecret = fetchInvoicePIClientSecretWithRetry(subscription, Duration.ofSeconds(12));
+    String setupIntentClientSecret = null;
+
+    if (!StringUtils.hasText(paymentIntentClientSecret)) {
+      log.warn("[BILL][FLOW] Não foi possível obter payment_intent.client_secret da assinatura {}", subscriptionId);
+      // Fallback: SetupIntent("card") — usado com Google Pay (forSetupIntent)
+      setupIntentClientSecret = createSetupIntentCs(customerId);
     }
 
-    // ===========================
-    // Helpers utilitários (novos)
-    // ===========================
+    // 4) Ephemeral Key para o app
+    EphemeralKey ek = EphemeralKey.create(
+        EphemeralKeyCreateParams.builder()
+            .setCustomer(customerId)
+            .setStripeVersion(stripeVersion)
+            .build()
+    );
 
-    private static boolean hasText(String s) { return s != null && !s.isEmpty(); }
+    log.info("[BILL][FLOW][RES] subId={}, customerId={}, hasPI={}, hasSI={}",
+        subscriptionId, customerId, paymentIntentClientSecret != null, setupIntentClientSecret != null);
 
-    /**
-     * Extrai o ID do PaymentIntent a partir de uma Invoice, cobrindo:
-     * - inv.getPaymentIntentObject() (objeto expandido)
-     * - inv.getPaymentIntent() (String ID) — pode não existir em alguns SDKs
-     * - JSON cru da Invoice (lastResponse), quando disponível
-     */
-    private static String tryGetPaymentIntentId(Invoice inv) {
-        if (inv == null) return null;
+    // 5) Retorno para o app Android (Google Pay)
+    return new SubscribeResponse(
+        stripePublishableKey,
+        customerId,
+        subscriptionId,
+        paymentIntentClientSecret,   // usado no GooglePay.presentGooglePay (cobrança)
+        ek.getSecret(),              // ephemeral key
+        setupIntentClientSecret,     // usado no GooglePay.presentGooglePay(forSetupIntent)
+        null                         // hostedInvoiceUrl (não aplicável)
+    );
+  }
 
-        // 1) Tenta via objeto expandido
-        try {
-            Method mObj = Invoice.class.getMethod("getPaymentIntentObject");
-            Object piObj = mObj.invoke(inv);
-            if (piObj instanceof PaymentIntent pi) {
-                try {
-                    String id = pi.getId();
-                    if (hasText(id)) return id;
-                } catch (Throwable ignored) {
-                    try {
-                        Method mid = pi.getClass().getMethod("getId");
-                        Object v = mid.invoke(pi);
-                        if (v instanceof String s && hasText(s)) return s;
-                    } catch (Throwable ignored2) {}
-                }
-            }
-        } catch (Throwable ignored) {}
+  public SubscriptionStatusResponse getStatus(String subscriptionId) throws StripeException {
+    Stripe.apiKey = stripeSecretKey;
+    final Subscription sub = Subscription.retrieve(subscriptionId);
+    final SubscriptionBackendStatus status = mapStatus(sub);
 
-        // 2) Tenta via getter antigo que retorna String
-        try {
-            Method mId = Invoice.class.getMethod("getPaymentIntent");
-            Object idObj = mId.invoke(inv);
-            if (idObj instanceof String s && hasText(s)) return s;
-        } catch (Throwable ignored) {}
+    String currentPeriodEndIso = null;
+    boolean cancelAtPeriodEnd = false;
+    try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); } catch (Throwable ignored) {}
 
-        // 3) Tenta via JSON cru (lastResponse)
-        try {
-            Object lastResp = invokeNoArg(inv, "getLastResponse");
-            String body = extractBody(lastResp);
-            if (body != null) {
-                JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-                JsonElement pie = root.get("payment_intent");
-                if (pie != null && !pie.isJsonNull()) {
-                    if (pie.isJsonObject()) {
-                        JsonElement idEl = pie.getAsJsonObject().get("id");
-                        if (idEl != null && !idEl.isJsonNull()) return idEl.getAsString();
-                    } else if (pie.isJsonPrimitive()) {
-                        return pie.getAsString();
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
+    return new SubscriptionStatusResponse(subscriptionId, status, currentPeriodEndIso, cancelAtPeriodEnd);
+  }
 
-        return null;
+  public void changePlan(String subscriptionId, String newPriceId, String prorationBehaviorRaw) throws StripeException {
+    Stripe.apiKey = stripeSecretKey;
+
+    final Subscription sub = Subscription.retrieve(subscriptionId);
+    final String itemId = (sub.getItems() != null && !sub.getItems().getData().isEmpty())
+        ? sub.getItems().getData().get(0).getId() : null;
+
+    final SubscriptionUpdateParams.Builder b = SubscriptionUpdateParams.builder();
+    final SubscriptionUpdateParams.ProrationBehavior pb = parseProration(prorationBehaviorRaw);
+    if (pb != null) b.setProrationBehavior(pb);
+
+    if (StringUtils.hasText(itemId)) {
+      b.addItem(SubscriptionUpdateParams.Item.builder().setId(itemId).setPrice(newPriceId).build());
+    } else {
+      b.addItem(SubscriptionUpdateParams.Item.builder().setPrice(newPriceId).build());
     }
 
-    /**
-     * Tenta extrair o client_secret de um PaymentIntent. Se necessário,
-     * faz um retrieve "fresh" baseado no id e tenta pelo JSON cru.
-     */
-    private static String tryExtractClientSecret(PaymentIntent pi) {
-        if (pi == null) return null;
+    final Subscription updated = sub.update(b.build());
+    log.info("[BILL][CHANGE_PLAN] subscriptionId={}, status={}", updated.getId(), updated.getStatus());
+  }
 
-        // getter direto (SDKs recentes)
-        try {
-            String cs = pi.getClientSecret();
-            if (hasText(cs)) return cs;
-        } catch (Throwable ignored) {}
-
-        // reflection (SDKs antigas)
-        try {
-            Method m = pi.getClass().getMethod("getClientSecret");
-            Object val = m.invoke(pi);
-            if (val instanceof String s && hasText(s)) return s;
-        } catch (Throwable ignored) {}
-
-        // Se veio de expansão e não tem body, re-retrieve pelo id
-        try {
-            String id = null;
-            try { id = pi.getId(); } catch (Throwable ignored) {
-                try {
-                    Method mid = pi.getClass().getMethod("getId");
-                    Object v = mid.invoke(pi);
-                    if (v instanceof String s) id = s;
-                } catch (Throwable ignored2) {}
-            }
-            if (hasText(id)) {
-                PaymentIntent fresh = PaymentIntent.retrieve(id);
-
-                try {
-                    String cs2 = fresh.getClientSecret();
-                    if (hasText(cs2)) return cs2;
-                } catch (Throwable ignored) {}
-
-                Object lastResp = invokeNoArg(fresh, "getLastResponse");
-                String body = extractBody(lastResp);
-                if (body != null) {
-                    JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-                    JsonElement cse = root.get("client_secret");
-                    if (cse != null && !cse.isJsonNull()) {
-                        String s = cse.getAsString();
-                        if (hasText(s)) return s;
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
-
-        // Última chance: JSON cru do próprio objeto recebido
-        try {
-            Object lastResp = invokeNoArg(pi, "getLastResponse");
-            String body = extractBody(lastResp);
-            if (body != null) {
-                JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-                JsonElement cse = root.get("client_secret");
-                if (cse != null && !cse.isJsonNull()) {
-                    String s = cse.getAsString();
-                    if (hasText(s)) return s;
-                }
-            }
-        } catch (Throwable ignored) {}
-
-        return null;
+  /** Chamado pelo StripeWebhookController ao processar eventos */
+  public void applyWebhookUpdate(Subscription sub, Invoice inv) {
+    try {
+      final String subIdSafe = (sub != null) ? sub.getId() : null;
+      final String invId = (inv != null) ? inv.getId() : null;
+      final SubscriptionBackendStatus status = (sub != null) ? mapStatus(sub) : SubscriptionBackendStatus.INACTIVE;
+      log.info("[BILL][WEBHOOK] subscriptionId={}, status={}, invoiceId={}", subIdSafe, status, invId);
+      // TODO: persistir status/datas em DB e publicar eventos internos
+    } catch (Exception e) {
+      log.error("[BILL][WEBHOOK][ERR] {}", e.getMessage(), e);
     }
+  }
 
-    /**
-     * Fallback: lista PIs do cliente e tenta achar o que pertence à invoice destino.
-     * Retorna o client_secret se encontrar.
-     */
-    private static String findClientSecretByListingPIs(String customerId, String targetInvoiceId) throws StripeException {
-        if (!hasText(customerId)) return null;
+  // ---------------- internals ----------------
 
-        com.stripe.param.PaymentIntentListParams.Builder b =
-            com.stripe.param.PaymentIntentListParams.builder()
-                .setCustomer(customerId)
-                .setLimit(10L)
-                .addExpand("data.invoice");
+  /** Cria SetupIntent forçando payment_method_types = "card". */
+  private String createSetupIntentCs(String customerId) throws StripeException {
+    SetupIntentCreateParams params = SetupIntentCreateParams.builder()
+        .setCustomer(customerId)
+        .setUsage(SetupIntentCreateParams.Usage.OFF_SESSION)
+        .addPaymentMethodType("card") // compatível com stripe-java 29.x
+        .build();
 
-        com.stripe.model.PaymentIntentCollection col = PaymentIntent.list(b.build());
-        if (col == null || col.getData() == null) return null;
-
-        // 1) Tenta casar explicitamente pela invoice
-        for (PaymentIntent pi : col.getData()) {
-            String invoiceId = null;
-            try {
-                invoiceId = (pi.getInvoiceObject() != null)
-                    ? pi.getInvoiceObject().getId()
-                    : pi.getInvoice();
-            } catch (Throwable ignored) {}
-
-            if (hasText(targetInvoiceId) && hasText(invoiceId) && targetInvoiceId.equals(invoiceId)) {
-                PaymentIntent fresh = PaymentIntent.retrieve(pi.getId());
-                String cs = tryExtractClientSecret(fresh);
-                if (hasText(cs)) return cs;
-            }
-        }
-
-        // 2) Se não houver targetInvoiceId, pega o mais novo com invoice não nulo
-        for (PaymentIntent pi : col.getData()) {
-            String invoiceId = null;
-            try {
-                invoiceId = (pi.getInvoiceObject() != null)
-                    ? pi.getInvoiceObject().getId()
-                    : pi.getInvoice();
-            } catch (Throwable ignored) {}
-            if (hasText(invoiceId)) {
-                PaymentIntent fresh = PaymentIntent.retrieve(pi.getId());
-                String cs = tryExtractClientSecret(fresh);
-                if (hasText(cs)) return cs;
-            }
-        }
-        return null;
+    SetupIntent si = SetupIntent.create(params);
+    String cs = si.getClientSecret();
+    if (!StringUtils.hasText(cs)) {
+      throw new IllegalStateException("SetupIntent criado sem client_secret (inesperado)");
     }
+    return cs;
+  }
 
-    /**
-     * Extrai client_secret do JSON cru da Invoice, quando disponível.
-     */
-    private static String tryExtractClientSecretFromInvoiceRaw(Invoice inv) {
-        try {
-            Object lastResp = invokeNoArg(inv, "getLastResponse");
-            String body = extractBody(lastResp);
-            if (body == null) return null;
+  /**
+   * Faz polling por alguns segundos até a fatura ter um PaymentIntent com client_secret.
+   * Retorna null quando: invoice segue draft; ou valor 0 (não haverá PI).
+   */
+  private String fetchInvoicePIClientSecretWithRetry(Subscription sub, Duration maxWait) throws StripeException {
+    final long deadline = System.nanoTime() + maxWait.toNanos();
+    int attempt = 0;
+    boolean triedFinalize = false;
 
-            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-            JsonElement pie = root.get("payment_intent");
-            if (pie == null || pie.isJsonNull()) return null;
+    while (System.nanoTime() < deadline) {
+      attempt++;
 
-            if (pie.isJsonObject()) {
-                JsonElement cse = pie.getAsJsonObject().get("client_secret");
-                if (cse != null && !cse.isJsonNull()) {
-                    String s = cse.getAsString();
-                    return hasText(s) ? s : null;
-                }
+      // Recarrega a assinatura com expand
+      try {
+        sub = Subscription.retrieve(
+            sub.getId(),
+            SubscriptionRetrieveParams.builder()
+                .addExpand("latest_invoice")
+                .addExpand("latest_invoice.payment_intent")
+                .build(),
+            null
+        );
+      } catch (Throwable t) {
+        log.debug("[BILL][PI-RETRY] reload sub failed: {}", t.getMessage());
+      }
+
+      // Tenta extrair do expand
+      String cs = tryExtractPIClientSecretFromSubscription(sub);
+      if (StringUtils.hasText(cs)) {
+        log.info("[BILL][PI-RETRY] client_secret obtido (expand) na tentativa {}", attempt);
+        return cs;
+      }
+
+      // Verifica invoice diretamente
+      Invoice inv = safeGetLatestInvoice(sub);
+      if (inv != null) {
+        String invStatus = inv.getStatus();
+        Long amountDue = safeGetAmountDue(inv);
+        Long total = safeGetTotal(inv);
+
+        if ("draft".equalsIgnoreCase(invStatus) && !triedFinalize) {
+          try {
+            inv = inv.finalizeInvoice();
+            triedFinalize = true;
+            cs = tryExtractPIClientSecretFromInvoice(inv);
+            if (StringUtils.hasText(cs)) {
+              log.info("[BILL][PI-RETRY] client_secret após finalizeInvoice na tentativa {}", attempt);
+              return cs;
             }
-        } catch (Throwable ignored) {}
-        return null;
-    }
+          } catch (Throwable t) {
+            log.debug("[BILL][PI-RETRY] finalizeInvoice falhou: {}", t.getMessage());
+          }
+        } else {
+          cs = tryExtractPIClientSecretFromInvoice(inv);
+          if (StringUtils.hasText(cs)) {
+            log.info("[BILL][PI-RETRY] client_secret obtido (invoice) na tentativa {}", attempt);
+            return cs;
+          }
 
-    /**
-     * Extrai client_secret a partir do JSON cru da Subscription (expand), quando disponível.
-     */
-    private static String tryExtractClientSecretFromSubscriptionRaw(Subscription sub) {
-        try {
-            Object lastResp = invokeNoArg(sub, "getLastResponse");
-            String body = extractBody(lastResp);
-            if (body == null) return null;
-
-            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-            JsonObject latestInvoice = root.has("latest_invoice") && root.get("latest_invoice").isJsonObject()
-                ? root.getAsJsonObject("latest_invoice")
-                : null;
-
-            if (latestInvoice == null) return null;
-
-            JsonElement pie = latestInvoice.get("payment_intent");
-            if (pie == null || pie.isJsonNull()) return null;
-
-            if (pie.isJsonObject()) {
-                JsonElement cse = pie.getAsJsonObject().get("client_secret");
-                if (cse != null && !cse.isJsonNull()) {
-                    String s = cse.getAsString();
-                    return hasText(s) ? s : null;
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    /**
-     * Invoca método sem argumentos por reflexão.
-     */
-    private static Object invokeNoArg(Object target, String methodName) {
-        if (target == null) return null;
-        try {
-            Method m = target.getClass().getMethod(methodName);
-            m.setAccessible(true);
-            return m.invoke(target);
-        } catch (Throwable ignored) {
+          boolean zeroNow = (nz(amountDue) == 0L) || (nz(total) == 0L);
+          if (zeroNow) {
+            log.info("[BILL][PI-RETRY] invoice valor 0 (amount_due={}, total={}), sem PI; usar SetupIntent.");
             return null;
+          }
         }
+      }
+
+      long base = 250L * Math.min(attempt, 8); // até ~2s
+      long sleep = base + (long)(Math.random() * 120);
+      sleepQuiet(sleep);
     }
 
-    /**
-     * Extrai a string do corpo a partir de um ApiResponse/StripeResponse,
-     * cobrindo variações do SDK (método body(), getBody() ou campo "body").
-     */
-    private static String extractBody(Object lastResponse) {
-        if (lastResponse == null) return null;
-        try {
-            // método body()
-            Method bodyM = lastResponse.getClass().getMethod("body");
-            bodyM.setAccessible(true);
-            Object v = bodyM.invoke(lastResponse);
-            if (v instanceof String s && hasText(s)) return s;
-        } catch (Throwable ignored) {}
+    log.warn("[BILL][PI-RETRY] Timeout sem obter client_secret para sub {}", sub.getId());
+    return null;
+  }
 
-        try {
-            // método getBody()
-            Method bodyM2 = lastResponse.getClass().getMethod("getBody");
-            bodyM2.setAccessible(true);
-            Object v = bodyM2.invoke(lastResponse);
-            if (v instanceof String s && hasText(s)) return s;
-        } catch (Throwable ignored) {}
+  private static Invoice safeGetLatestInvoice(Subscription sub) {
+    if (sub == null) return null;
+    try {
+      Invoice inv = sub.getLatestInvoiceObject();
+      if (inv != null) return inv;
+    } catch (Throwable ignored) {}
 
-        try {
-            // campo "body"
-            Field f = lastResponse.getClass().getDeclaredField("body");
-            f.setAccessible(true);
-            Object v = f.get(lastResponse);
-            if (v instanceof String s && hasText(s)) return s;
-        } catch (Throwable ignored) {}
+    try {
+      String invId = sub.getLatestInvoice();
+      if (StringUtils.hasText(invId)) {
+        return Invoice.retrieve(invId, InvoiceRetrieveParams.builder().addExpand("payment_intent").build(), null);
+      }
+    } catch (Throwable ignored) {}
+    return null;
+  }
 
-        return null;
+  private static String tryExtractPIClientSecretFromSubscription(Subscription subscription) {
+    try {
+      Invoice inv = subscription.getLatestInvoiceObject();
+      if (inv == null) return null;
+      return tryExtractPIClientSecretFromInvoice(inv);
+    } catch (Throwable ignored) {
+      return null;
     }
+  }
 
-    // =====================================================================
-    // >>> OUTROS MÉTODOS DO SERVIÇO (create subscription, cancel, status etc)
-    //     permanecem como já estão no seu projeto.
-    //     Garanta apenas que, dentro de startSubscription(...),
-    //     a chamada ao polling ficou assim:
-    //
-    //     String piClientSecret = fetchPIClientSecretBlocking(subscription, customerId, Duration.ofSeconds(45));
-    //
-    // =====================================================================
+  private static String tryExtractPIClientSecretFromInvoice(Invoice inv) throws StripeException {
+    if (inv == null) return null;
+
+    // 1) objeto expandido
+    try {
+      Method mObj = Invoice.class.getMethod("getPaymentIntentObject");
+      Object piObj = mObj.invoke(inv);
+      if (piObj instanceof PaymentIntent) {
+        String cs = ((PaymentIntent) piObj).getClientSecret();
+        if (StringUtils.hasText(cs)) return cs;
+      }
+    } catch (Throwable ignored) {}
+
+    // 2) via ID
+    try {
+      Method mId = Invoice.class.getMethod("getPaymentIntent");
+      Object idObj = mId.invoke(inv);
+      if (idObj instanceof String piId && StringUtils.hasText(piId)) {
+        PaymentIntent pi = PaymentIntent.retrieve(piId);
+        String cs = pi.getClientSecret();
+        if (StringUtils.hasText(cs)) return cs;
+      }
+    } catch (Throwable ignored) {}
+
+    return null;
+  }
+
+  private static Long safeGetAmountDue(Invoice inv) {
+    try { return inv.getAmountDue(); } catch (Throwable ignored) { return null; }
+  }
+
+  private static Long safeGetTotal(Invoice inv) {
+    try { return inv.getTotal(); } catch (Throwable ignored) { return null; }
+  }
+
+  private static long nz(Long v) { return (v == null) ? 0L : v; }
+
+  private static void sleepQuiet(long millis) {
+    try { Thread.sleep(millis); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+  }
+
+  private static String require(String v, String field) {
+    if (!StringUtils.hasText(v)) throw new IllegalArgumentException(field + " é obrigatório");
+    return v;
+  }
+
+  private static SubscriptionBackendStatus mapStatus(Subscription sub) {
+    if (sub == null || sub.getStatus() == null) return SubscriptionBackendStatus.INACTIVE;
+    return switch (sub.getStatus()) {
+      case "incomplete" -> SubscriptionBackendStatus.INCOMPLETE;
+      case "incomplete_expired" -> SubscriptionBackendStatus.INCOMPLETE_EXPIRED;
+      case "trialing" -> SubscriptionBackendStatus.TRIALING;
+      case "active" -> SubscriptionBackendStatus.ACTIVE;
+      case "past_due" -> SubscriptionBackendStatus.PAST_DUE;
+      case "canceled" -> SubscriptionBackendStatus.CANCELED;
+      case "unpaid" -> SubscriptionBackendStatus.UNPAID;
+      default -> SubscriptionBackendStatus.INACTIVE;
+    };
+  }
+
+  private static SubscriptionUpdateParams.ProrationBehavior parseProration(String s) {
+    if (!StringUtils.hasText(s)) return null;
+    return switch (s) {
+      case "create_prorations" -> SubscriptionUpdateParams.ProrationBehavior.CREATE_PRORATIONS;
+      case "none" -> SubscriptionUpdateParams.ProrationBehavior.NONE;
+      case "always_invoice" -> SubscriptionUpdateParams.ProrationBehavior.ALWAYS_INVOICE;
+      default -> null;
+    };
+  }
 }
