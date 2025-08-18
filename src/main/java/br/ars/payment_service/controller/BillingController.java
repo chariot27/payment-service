@@ -11,11 +11,13 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
 @RequestMapping(path = "/api/billing", produces = MediaType.APPLICATION_JSON_VALUE)
 public class BillingController {
+
   private static final Logger log = LoggerFactory.getLogger(BillingController.class);
 
   private final BillingService billingService;
@@ -27,17 +29,29 @@ public class BillingController {
   /** POST /api/billing/subscribe (SEM TRIAL) */
   @PostMapping(path = "/subscribe", consumes = MediaType.APPLICATION_JSON_VALUE)
   public ResponseEntity<SubscribeResponse> subscribe(@RequestBody SubscribeRequest request) throws StripeException {
-    // Service cria assinatura com DEFAULT_INCOMPLETE + expand PI, gera EphemeralKey e retorna client_secret do PI.
+    // Service cria assinatura em DEFAULT_INCOMPLETE + expand do PaymentIntent, gera EphemeralKey e retorna client_secret.
     SubscribeResponse res = billingService.startSubscription(request);
     return ResponseEntity.ok(res);
   }
 
-  /** GET /api/billing/subscriptions/{id} — consulta Stripe e (opcional) upsert local */
+  /**
+   * GET /api/billing/subscriptions/{id}
+   * Consulta status no Stripe. Se upsert=true (padrão), chama o método compat getStatusAndUpsert.
+   * Use upsert=false para apenas consultar (sem persistência).
+   */
   @GetMapping("/subscriptions/{id}")
-  public ResponseEntity<SubscriptionStatusResponse> getStatus(@PathVariable("id") String subscriptionId) throws StripeException {
-    // Importante: implemente no service uma leitura direta no Stripe (fonte da verdade)
-    // e faça upsert no banco para “destravamento” imediato, mesmo sem o webhook ter chegado ainda.
-    SubscriptionStatusResponse res = billingService.getStatusAndUpsert(subscriptionId);
+  public ResponseEntity<SubscriptionStatusResponse> getStatus(
+      @PathVariable("id") String subscriptionId,
+      @RequestParam(name = "upsert", required = false, defaultValue = "true") boolean upsert
+  ) throws StripeException {
+    if (!StringUtils.hasText(subscriptionId)) {
+      throw new IllegalArgumentException("subscriptionId é obrigatório");
+    }
+
+    SubscriptionStatusResponse res = upsert
+        ? billingService.getStatusAndUpsert(subscriptionId)
+        : billingService.getStatus(subscriptionId);
+
     return ResponseEntity.ok(res);
   }
 

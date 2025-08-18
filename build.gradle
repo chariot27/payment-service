@@ -11,42 +11,46 @@ java {
     toolchain { languageVersion = JavaLanguageVersion.of(17) }
 }
 
-repositories { mavenCentral() }
+repositories {
+    mavenCentral()
+}
 
 dependencies {
+    // Spring Boot
     implementation 'org.springframework.boot:spring-boot-starter-web'
     implementation 'org.springframework.boot:spring-boot-starter-validation'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.boot:spring-boot-starter-security' // HttpSecurity / SecurityFilterChain
+
+    // Observabilidade
     implementation 'io.micrometer:micrometer-registry-prometheus'
 
+    // Stripe (29.4.0+ tem Invoice.getPaymentIntentObject)
+    implementation 'com.stripe:stripe-java:29.9.0'
+
+    // Utilitários
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'com.github.ben-manes.caffeine:caffeine:3.1.8'
     implementation 'com.google.zxing:core:3.5.3'
     implementation 'com.google.zxing:javase:3.5.3'
-    implementation 'com.github.ben-manes.caffeine:caffeine:3.1.8'
 
+    // DB
     runtimeOnly 'org.postgresql:postgresql'
 
+    // Lombok
     compileOnly 'org.projectlombok:lombok:1.18.32'
     annotationProcessor 'org.projectlombok:lombok:1.18.32'
 
-    implementation 'com.google.code.gson:gson:2.10.1'
-    implementation 'com.google.zxing:core:3.5.3'
-    implementation 'com.google.zxing:javase:3.5.3'
-
-
+    // Testes
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
-    
-    implementation 'com.stripe:stripe-java:29.4.0'
-
-    // 👇 NECESSÁRIO para HttpSecurity / SecurityFilterChain
-    implementation 'org.springframework.boot:spring-boot-starter-security'
-
-
 }
 
-tasks.withType(Test).configureEach { useJUnitPlatform() }
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
 
-/** Aqui está o ajuste: use um bloco para layered() */
+// Empacotamento em camadas para startup mais rápido em container
 tasks.named('bootJar', org.springframework.boot.gradle.tasks.bundling.BootJar) {
     layered {
         enabled = true

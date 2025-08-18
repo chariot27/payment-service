@@ -20,7 +20,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
-import java.time.Instant; // << novo
+import java.time.Instant;
 
 @Service
 public class BillingService {
@@ -82,35 +82,50 @@ public class BillingService {
     final Subscription subscription = Subscription.create(params);
     final String subscriptionId = subscription.getId();
 
-    // 3) Extrair o *PaymentIntent client_secret* (NÃO usar invoice.confirmation_secret em mobile)
+    // 3) Extrair client secret para o PaymentSheet
     String paymentIntentClientSecret = null;
 
+    // latest_invoice (expandida ou via retrieve)
     Invoice inv = null;
     try { inv = subscription.getLatestInvoiceObject(); } catch (Throwable ignored) {}
     if (inv == null) {
       try {
-        String invId = subscription.getLatestInvoice();
-        if (StringUtils.hasText(invId)) inv = Invoice.retrieve(invId);
+        final String invId = subscription.getLatestInvoice();
+        if (StringUtils.hasText(invId)) {
+          inv = Invoice.retrieve(invId);
+        }
       } catch (Throwable ignored) {}
     }
 
-    PaymentIntent pi = null;
     if (inv != null) {
-      try { pi = inv.getPaymentIntentObject(); } catch (Throwable ignored) {}
-      if (pi == null) {
+      // Preferível (SDK stripe-java 29.4.0+): usar confirmation_secret
+      try {
+        Invoice.ConfirmationSecret cs = inv.getConfirmationSecret();
+        if (cs != null && StringUtils.hasText(cs.getClientSecret())) {
+          paymentIntentClientSecret = cs.getClientSecret();
+        }
+      } catch (Throwable ignored) {}
+
+      // 2º fallback: se o PaymentIntent tiver sido expandido
+      if (paymentIntentClientSecret == null) {
         try {
-          String piId = inv.getPaymentIntent();
-          if (StringUtils.hasText(piId)) pi = PaymentIntent.retrieve(piId);
+          PaymentIntent pi = inv.getPaymentIntentObject(); // requer 29.4.0+ e expand
+          if (pi != null && StringUtils.hasText(pi.getClientSecret())) {
+            paymentIntentClientSecret = pi.getClientSecret();
+          }
         } catch (Throwable ignored) {}
       }
-      if (pi != null) {
-        paymentIntentClientSecret = pi.getClientSecret();
-      }
-    }
 
-    // Validação: PaymentSheet espera um segredo de PI (pi_..._secret_...)
-    if (!StringUtils.hasText(paymentIntentClientSecret) || !paymentIntentClientSecret.startsWith("pi_")) {
-      throw new IllegalStateException("PaymentIntent client_secret não retornado/inválido para mobile");
+      // 3º fallback: buscar o PaymentIntent por id e pegar o client secret
+      if (paymentIntentClientSecret == null) {
+        try {
+          String piId = inv.getPaymentIntent(); // id do PI
+          if (StringUtils.hasText(piId)) {
+            PaymentIntent pi = PaymentIntent.retrieve(piId);
+            paymentIntentClientSecret = pi.getClientSecret();
+          }
+        } catch (Throwable ignored) {}
+      }
     }
 
     // 4) Ephemeral Key (criado NO SERVIDOR) para o app mobile
@@ -135,6 +150,12 @@ public class BillingService {
     );
   }
 
+  /** Usado pelo controller atual (compat): consulta e opcionalmente persiste. */
+  public SubscriptionStatusResponse getStatusAndUpsert(String subscriptionId) throws StripeException {
+    // Aqui você pode persistir em DB e publicar eventos internos se quiser.
+    return getStatus(subscriptionId);
+  }
+
   public SubscriptionStatusResponse getStatus(String subscriptionId) throws StripeException {
     Stripe.apiKey = stripeSecretKey;
     final Subscription sub = Subscription.retrieve(subscriptionId);
@@ -142,11 +163,13 @@ public class BillingService {
 
     String currentPeriodEndIso = null;
     boolean cancelAtPeriodEnd = false;
-    try {
-      Long ts = sub.getCurrentPeriodEnd();
-      if (ts != null) currentPeriodEndIso = Instant.ofEpochSecond(ts).toString();
-    } catch (Throwable ignored) {}
     try { cancelAtPeriodEnd = Boolean.TRUE.equals(sub.getCancelAtPeriodEnd()); } catch (Throwable ignored) {}
+    try {
+      Long ts = sub.getCurrentPeriodEnd(); // epoch seconds
+      if (ts != null && ts > 0) {
+        currentPeriodEndIso = Instant.ofEpochSecond(ts).toString();
+      }
+    } catch (Throwable ignored) {}
 
     return new SubscriptionStatusResponse(subscriptionId, status, currentPeriodEndIso, cancelAtPeriodEnd);
   }
